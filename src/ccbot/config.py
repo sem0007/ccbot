@@ -1,6 +1,6 @@
-"""Application configuration — reads env vars and exposes a singleton.
+"""Application configuration - reads env vars and exposes a singleton.
 
-Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, tmux/Claude paths, and
+Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, tmux/Codex/Claude paths, and
 monitoring intervals from environment variables (with .env support).
 .env loading priority: local .env (cwd) > $CCBOT_DIR/.env (default ~/.ccbot).
 The module-level `config` instance is imported by nearly every other module.
@@ -18,24 +18,47 @@ from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
 
-# Env vars that must not leak to child processes (e.g. Claude Code via tmux)
+# Env vars that must not leak to child processes (e.g. agent CLIs via tmux)
 SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
+
+AGENT_CLAUDE = "claude"
+AGENT_CODEX = "codex"
+VALID_AGENTS = {AGENT_CLAUDE, AGENT_CODEX}
+
+AGENT_ALIASES = {
+    AGENT_CLAUDE: AGENT_CLAUDE,
+    "tmux": AGENT_CLAUDE,
+    "claude_code": AGENT_CLAUDE,
+    AGENT_CODEX: AGENT_CODEX,
+    "codex_remote": AGENT_CODEX,
+}
+
+
+def normalize_agent_name(value: str, *, var_name: str = "agent") -> str:
+    """Normalize agent aliases from env/state into canonical agent names."""
+    normalized = AGENT_ALIASES.get(value.strip().lower())
+    if not normalized:
+        raise ValueError(
+            f"{var_name} must be one of {sorted(VALID_AGENTS)}, got {value!r}"
+        )
+    return normalized
 
 
 class Config:
     """Application configuration loaded from environment variables."""
 
     def __init__(self) -> None:
-        self.config_dir = ccbot_dir()
-        self.config_dir.mkdir(parents=True, exist_ok=True)
-
         # Load .env: local (cwd) takes priority over config_dir
         # load_dotenv default override=False means first-loaded wins
         local_env = Path(".env")
-        global_env = self.config_dir / ".env"
         if local_env.is_file():
             load_dotenv(local_env)
             logger.debug("Loaded env from %s", local_env.resolve())
+
+        self.config_dir = ccbot_dir()
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+
+        global_env = self.config_dir / ".env"
         if global_env.is_file():
             load_dotenv(global_env)
             logger.debug("Loaded env from %s", global_env)
@@ -57,12 +80,58 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
+        self.default_agent = normalize_agent_name(
+            os.getenv("CCBOT_DEFAULT_AGENT", AGENT_CLAUDE),
+            var_name="CCBOT_DEFAULT_AGENT",
+        )
+
+        enabled_agents_raw = os.getenv("CCBOT_ENABLED_AGENTS")
+        if enabled_agents_raw:
+            enabled_agents: list[str] = []
+            for item in enabled_agents_raw.split(","):
+                if not item.strip():
+                    continue
+                agent = normalize_agent_name(item, var_name="CCBOT_ENABLED_AGENTS")
+                if agent not in enabled_agents:
+                    enabled_agents.append(agent)
+            if not enabled_agents:
+                raise ValueError("CCBOT_ENABLED_AGENTS must contain at least one agent")
+        else:
+            enabled_agents = [AGENT_CLAUDE]
+
+        if self.default_agent not in enabled_agents:
+            raise ValueError(
+                "CCBOT_DEFAULT_AGENT must be included in CCBOT_ENABLED_AGENTS"
+            )
+        self.enabled_agents = tuple(enabled_agents)
+
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
         self.tmux_main_window_name = "__main__"
 
-        # Claude command to run in new windows
+        # Agent commands to run in new tmux windows or remote app-server mode.
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
+        self.codex_command = os.getenv("CODEX_COMMAND", "codex")
+
+        # Codex app-server remote transport configuration. This uses the
+        # official app-server JSON-RPC protocol over WebSocket so tmux-hosted
+        # Codex TUI clients can attach with `codex --remote`.
+        self.codex_app_server_listen = os.getenv(
+            "CODEX_APP_SERVER_LISTEN", "ws://127.0.0.1:0"
+        )
+        self.codex_approval_policy = os.getenv("CODEX_APPROVAL_POLICY", "never")
+        self.codex_sandbox = os.getenv("CODEX_SANDBOX", "workspace-write")
+        self.codex_dangerously_bypass_approvals_and_sandbox = (
+            os.getenv("CODEX_DANGEROUSLY_BYPASS_APPROVALS_AND_SANDBOX", "true").lower()
+            != "false"
+        )
+        self.codex_disable_update_check = (
+            os.getenv("CCBOT_CODEX_DISABLE_UPDATE_CHECK", "true").lower() != "false"
+        )
+        self.codex_session_persist_timeout = float(
+            os.getenv("CCBOT_CODEX_SESSION_PERSIST_TIMEOUT", "10.0")
+        )
+        self.codex_model = os.getenv("CODEX_MODEL") or None
 
         # All state files live under config_dir
         self.state_file = self.config_dir / "state.json"
@@ -81,6 +150,16 @@ class Config:
             self.claude_projects_path = Path(claude_config_dir) / "projects"
         else:
             self.claude_projects_path = Path.home() / ".claude" / "projects"
+
+        # Codex session monitoring/listing configuration.
+        # Priority: CCBOT_CODEX_HOME > CODEX_HOME > default ~/.codex
+        self.codex_home = Path(
+            os.getenv("CCBOT_CODEX_HOME")
+            or os.getenv("CODEX_HOME")
+            or Path.home() / ".codex"
+        )
+        self.codex_sessions_path = self.codex_home / "sessions"
+        self.codex_session_index_file = self.codex_home / "session_index.jsonl"
 
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
@@ -125,6 +204,15 @@ class Config:
     def is_user_allowed(self, user_id: int) -> bool:
         """Check if a user is in the allowed list."""
         return user_id in self.allowed_users
+
+    def is_agent_enabled(self, agent: str) -> bool:
+        """Return True when an agent is enabled for new sessions."""
+        return normalize_agent_name(agent) in self.enabled_agents
+
+    def agent_label(self, agent: str) -> str:
+        """Human-readable label for an agent."""
+        normalized = normalize_agent_name(agent)
+        return "Codex" if normalized == AGENT_CODEX else "Claude"
 
 
 config = Config()

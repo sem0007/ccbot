@@ -139,6 +139,24 @@ class TranscriptParser:
 
         return "\n".join(texts)
 
+    @staticmethod
+    def extract_codex_text(content_list: list[Any]) -> str:
+        """Extract text from Codex Responses-style content items."""
+        if not isinstance(content_list, list):
+            return str(content_list) if content_list else ""
+
+        texts = []
+        for item in content_list:
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type in ("input_text", "output_text", "text"):
+                    text = item.get("text", "")
+                    if text:
+                        texts.append(text)
+        return "\n".join(texts)
+
     _RE_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
     _RE_COMMAND_NAME = re.compile(r"<command-name>(.*?)</command-name>")
@@ -284,6 +302,59 @@ class TranscriptParser:
         """
         msg_type = cls.get_message_type(data)
 
+        if msg_type == "response_item":
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                return None
+            payload_type = payload.get("type")
+            if payload_type == "message":
+                role = payload.get("role", "")
+                if role not in ("user", "assistant"):
+                    return None
+                text = cls.extract_codex_text(payload.get("content", []))
+                text = cls._RE_ANSI_ESCAPE.sub("", text)
+                return ParsedMessage(message_type=role, text=text)
+            if payload_type == "reasoning":
+                parts = []
+                summary = payload.get("summary")
+                if isinstance(summary, list):
+                    for item in summary:
+                        if isinstance(item, dict):
+                            t = item.get("text") or item.get("summary_text")
+                            if t:
+                                parts.append(str(t))
+                        elif item:
+                            parts.append(str(item))
+                content = payload.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            t = item.get("text")
+                            if t:
+                                parts.append(str(t))
+                return ParsedMessage(message_type="thinking", text="\n".join(parts))
+            if payload_type == "local_shell_call":
+                action = payload.get("action")
+                command = ""
+                if isinstance(action, dict):
+                    command = str(action.get("command") or "")
+                return ParsedMessage(
+                    message_type="tool_use", text=command, tool_name="Bash"
+                )
+            if payload_type == "function_call":
+                return ParsedMessage(
+                    message_type="tool_use",
+                    text=str(payload.get("arguments") or ""),
+                    tool_name=str(payload.get("name") or "function_call"),
+                )
+            if payload_type in ("function_call_output", "custom_tool_call_output"):
+                output = payload.get("output")
+                if isinstance(output, dict):
+                    text = output.get("text") or output.get("content") or str(output)
+                else:
+                    text = str(output or "")
+                return ParsedMessage(message_type="tool_result", text=text)
+
         if msg_type not in ("user", "assistant"):
             return None
 
@@ -370,7 +441,7 @@ class TranscriptParser:
         elif tool_name == "Write":
             # Write: line count comes from the input content, not the result
             # (result is usually just "File created successfully at: ...")
-            written = tool_input_data.get("content", "") if tool_input_data else ""
+            written = tool_input_data.get("content", "") if tool_input_data else text
             if not written:
                 written_lines = 0
             else:
@@ -421,6 +492,95 @@ class TranscriptParser:
         return cls._format_expandable_quote(text)
 
     @classmethod
+    def _parse_codex_response_item(cls, data: dict) -> list[ParsedEntry]:
+        """Parse a Codex rollout `response_item` entry."""
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            return []
+
+        timestamp = cls.get_timestamp(data)
+        payload_type = payload.get("type")
+
+        if payload_type == "message":
+            role = payload.get("role", "")
+            if role not in ("user", "assistant"):
+                return []
+            text = cls.extract_codex_text(payload.get("content", [])).strip()
+            if not text:
+                return []
+            return [
+                ParsedEntry(
+                    role=role,
+                    text=text,
+                    content_type="text",
+                    timestamp=timestamp,
+                )
+            ]
+
+        if payload_type == "reasoning":
+            parsed = cls.parse_message(data)
+            if not parsed or not parsed.text.strip():
+                return []
+            return [
+                ParsedEntry(
+                    role="assistant",
+                    text=cls._format_expandable_quote(parsed.text.strip()),
+                    content_type="thinking",
+                    timestamp=timestamp,
+                )
+            ]
+
+        if payload_type == "local_shell_call":
+            call_id = payload.get("call_id")
+            action = payload.get("action")
+            command = ""
+            if isinstance(action, dict):
+                command = str(action.get("command") or "")
+            summary = cls.format_tool_use_summary("Bash", {"command": command})
+            return [
+                ParsedEntry(
+                    role="assistant",
+                    text=summary,
+                    content_type="tool_use",
+                    tool_use_id=str(call_id) if call_id else None,
+                    timestamp=timestamp,
+                    tool_name="Bash",
+                )
+            ]
+
+        if payload_type == "function_call":
+            call_id = payload.get("call_id")
+            name = str(payload.get("name") or "function_call")
+            args = payload.get("arguments") or ""
+            summary = cls.format_tool_use_summary(name, {"arguments": str(args)})
+            return [
+                ParsedEntry(
+                    role="assistant",
+                    text=summary,
+                    content_type="tool_use",
+                    tool_use_id=str(call_id) if call_id else None,
+                    timestamp=timestamp,
+                    tool_name=name,
+                )
+            ]
+
+        if payload_type in ("function_call_output", "custom_tool_call_output"):
+            call_id = payload.get("call_id")
+            parsed = cls.parse_message(data)
+            text = parsed.text if parsed else ""
+            return [
+                ParsedEntry(
+                    role="assistant",
+                    text=cls._format_tool_result_text(text) if text else "",
+                    content_type="tool_result",
+                    tool_use_id=str(call_id) if call_id else None,
+                    timestamp=timestamp,
+                )
+            ]
+
+        return []
+
+    @classmethod
     def parse_entries(
         cls,
         entries: list[dict],
@@ -452,6 +612,10 @@ class TranscriptParser:
 
         for data in entries:
             msg_type = cls.get_message_type(data)
+            if msg_type == "response_item":
+                result.extend(cls._parse_codex_response_item(data))
+                continue
+
             if msg_type not in ("user", "assistant"):
                 continue
 

@@ -325,12 +325,69 @@ class TestParseEntries:
         assert result[0].text == "Hello!"
         assert result[0].content_type == "text"
 
+    def test_codex_assistant_response_item(self):
+        entries = [
+            {
+                "timestamp": "2026-05-20T00:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello from Codex"}],
+                },
+            }
+        ]
+        result, pending = TranscriptParser.parse_entries(entries)
+        assert len(result) == 1
+        assert result[0].role == "assistant"
+        assert result[0].text == "Hello from Codex"
+        assert result[0].content_type == "text"
+        assert not pending
+
     def test_user_text(self, make_jsonl_entry, make_text_block):
         entries = [make_jsonl_entry("user", [make_text_block("Hi bot")])]
         result, pending = TranscriptParser.parse_entries(entries)
         assert len(result) == 1
         assert result[0].role == "user"
         assert result[0].text == "Hi bot"
+
+    def test_codex_user_response_item(self):
+        entries = [
+            {
+                "timestamp": "2026-05-20T00:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hi Codex"}],
+                },
+            }
+        ]
+        result, pending = TranscriptParser.parse_entries(entries)
+        assert len(result) == 1
+        assert result[0].role == "user"
+        assert result[0].text == "Hi Codex"
+        assert not pending
+
+    def test_codex_local_shell_call_uses_bash_tool_name(self):
+        entries = [
+            {
+                "timestamp": "2026-05-20T00:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "local_shell_call",
+                    "call_id": "call_1",
+                    "action": {"command": "pwd"},
+                },
+            }
+        ]
+        result, pending = TranscriptParser.parse_entries(entries)
+        assert len(result) == 1
+        assert result[0].content_type == "tool_use"
+        assert result[0].tool_use_id == "call_1"
+        assert result[0].tool_name == "Bash"
+        assert result[0].text == "**Bash**(pwd)"
+        assert not pending
 
     def test_tool_use_and_result_pairing(
         self,

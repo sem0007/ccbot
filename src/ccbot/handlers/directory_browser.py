@@ -21,8 +21,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ..session import ClaudeSession
 
-from ..config import config
+from ..config import AGENT_CODEX, config
 from .callback_data import (
+    CB_AGENT_CANCEL,
+    CB_AGENT_SELECT,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
@@ -42,6 +44,7 @@ DIRS_PER_PAGE = 6
 # User state keys
 STATE_KEY = "state"
 STATE_BROWSING_DIRECTORY = "browsing_directory"
+STATE_SELECTING_AGENT = "selecting_agent"
 STATE_SELECTING_WINDOW = "selecting_window"
 BROWSE_PATH_KEY = "browse_path"
 BROWSE_PAGE_KEY = "browse_page"
@@ -49,6 +52,7 @@ BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
+SELECTED_AGENT_KEY = "_selected_agent"
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -58,6 +62,12 @@ def clear_browse_state(user_data: dict | None) -> None:
         user_data.pop(BROWSE_PATH_KEY, None)
         user_data.pop(BROWSE_PAGE_KEY, None)
         user_data.pop(BROWSE_DIRS_KEY, None)
+
+
+def clear_agent_picker_state(user_data: dict | None) -> None:
+    """Clear agent picker state keys from user_data."""
+    if user_data is not None:
+        user_data.pop(STATE_KEY, None)
 
 
 def clear_window_picker_state(user_data: dict | None) -> None:
@@ -72,6 +82,24 @@ def clear_session_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(SESSIONS_KEY, None)
+
+
+def build_agent_picker(agents: tuple[str, ...] | list[str]) -> InlineKeyboardMarkup:
+    """Build an agent picker UI for starting a new session."""
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for agent in agents:
+        label = "Codex" if agent == AGENT_CODEX else "Claude"
+        icon = "◎" if agent == AGENT_CODEX else "◇"
+        row.append(
+            InlineKeyboardButton(
+                f"{icon} {label}", callback_data=f"{CB_AGENT_SELECT}{agent}"
+            )
+        )
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("Cancel", callback_data=CB_AGENT_CANCEL)])
+    return InlineKeyboardMarkup(buttons)
 
 
 def build_window_picker(
@@ -120,7 +148,7 @@ def build_window_picker(
 
 
 def build_directory_browser(
-    current_path: str, page: int = 0
+    current_path: str, page: int = 0, agent: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup, list[str]]:
     """Build directory browser UI.
 
@@ -185,10 +213,15 @@ def build_directory_browser(
     buttons.append(action_row)
 
     display_path = str(path).replace(str(Path.home()), "~")
+    agent_line = ""
+    if agent:
+        label = "Codex" if agent == AGENT_CODEX else "Claude"
+        agent_line = f"\nAgent: *{label}*"
+
     if not subdirs:
-        text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\n_(No subdirectories)_"
+        text = f"*Select Working Directory*{agent_line}\n\nCurrent: `{display_path}`\n\n_(No subdirectories)_"
     else:
-        text = f"*Select Working Directory*\n\nCurrent: `{display_path}`\n\nTap a folder to enter, or select current directory"
+        text = f"*Select Working Directory*{agent_line}\n\nCurrent: `{display_path}`\n\nTap a folder to enter, or select current directory"
 
     return text, InlineKeyboardMarkup(buttons), subdirs
 
@@ -213,7 +246,7 @@ def _relative_time(file_path: str) -> str:
 
 
 def build_session_picker(
-    sessions: list[ClaudeSession],
+    sessions: list[ClaudeSession], agent: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build session picker UI for resuming an existing Claude session.
 
@@ -222,9 +255,10 @@ def build_session_picker(
 
     Returns: (text, keyboard).
     """
+    label = "Codex" if agent == AGENT_CODEX else "Claude"
     lines = [
         "*Resume Session?*\n",
-        "Existing sessions found in this directory.\n",
+        f"Existing {label} sessions found in this directory.\n",
     ]
     for i, s in enumerate(sessions):
         summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary

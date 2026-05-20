@@ -24,6 +24,26 @@ class TestConfigIntegration:
         assert cfg.telegram_bot_token == "from-dotenv-token"
         assert cfg.is_user_allowed(99999)
 
+    def test_local_env_can_set_config_dir(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / "ccbot-state"
+        config_dir.mkdir()
+        (config_dir / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=from-config-dir\nALLOWED_USERS=42\n"
+        )
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        (workdir / ".env").write_text(f"CCBOT_DIR={config_dir}\n")
+        monkeypatch.chdir(workdir)
+        monkeypatch.delenv("CCBOT_DIR", raising=False)
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("ALLOWED_USERS", raising=False)
+
+        cfg = Config()
+
+        assert cfg.config_dir == config_dir
+        assert cfg.telegram_bot_token == "from-config-dir"
+        assert cfg.is_user_allowed(42)
+
     def test_creates_config_dir_if_missing(self, tmp_path, monkeypatch):
         new_dir = tmp_path / "nonexistent"
         monkeypatch.setenv("CCBOT_DIR", str(new_dir))

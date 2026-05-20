@@ -48,9 +48,15 @@ def main() -> None:
     from .tmux_manager import tmux_manager
 
     logger.info("Allowed users: %s", config.allowed_users)
-    logger.info("Claude projects path: %s", config.claude_projects_path)
+    logger.info("Enabled agents: %s", ", ".join(config.enabled_agents))
+    logger.info("Default agent: %s", config.default_agent)
+    if config.is_agent_enabled("codex"):
+        logger.info("Codex sessions path: %s", config.codex_sessions_path)
+    if config.is_agent_enabled("claude"):
+        logger.info("Claude projects path: %s", config.claude_projects_path)
 
-    # Ensure tmux session exists
+    # Ensure tmux session exists. Codex remote mode still hosts visible TUI
+    # clients in tmux windows; only control/streaming uses app-server.
     session = tmux_manager.get_or_create_session()
     logger.info("Tmux session '%s' ready", session.session_name)
 

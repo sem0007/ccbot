@@ -170,6 +170,15 @@ async def status_poll_loop(bot: Bot) -> None:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
+                        if session_manager.is_codex_window(wid):
+                            logger.debug(
+                                "Codex remote window %s not visible; preserving "
+                                "binding user=%d thread=%d",
+                                wid,
+                                user_id,
+                                thread_id,
+                            )
+                            continue
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(

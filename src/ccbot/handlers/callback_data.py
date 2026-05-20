@@ -28,6 +28,10 @@ CB_WIN_BIND = "wb:sel:"  # wb:sel:<index>
 CB_WIN_NEW = "wb:new"  # proceed to directory browser
 CB_WIN_CANCEL = "wb:cancel"
 
+# Agent picker
+CB_AGENT_SELECT = "ag:sel:"  # ag:sel:<agent>
+CB_AGENT_CANCEL = "ag:cancel"
+
 # Screenshot
 CB_SCREENSHOT_REFRESH = "ss:ref:"
 

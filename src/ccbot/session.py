@@ -32,7 +32,12 @@ from typing import Any
 
 import aiofiles
 
-from .config import config
+from .codex_remote import (
+    codex_thread_id_from_window_id,
+    is_codex_window_id,
+    make_codex_window_id,
+)
+from .config import AGENT_CLAUDE, AGENT_CODEX, config, normalize_agent_name
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
@@ -45,17 +50,20 @@ class WindowState:
     """Persistent state for a tmux window.
 
     Attributes:
-        session_id: Associated Claude session ID (empty if not yet detected)
+        agent: Agent type that owns this window ("claude" or "codex")
+        session_id: Associated agent session/thread ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
     """
 
+    agent: str = ""
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
+            "agent": self.agent or AGENT_CLAUDE,
             "session_id": self.session_id,
             "cwd": self.cwd,
         }
@@ -64,8 +72,23 @@ class WindowState:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "WindowState":
+    def from_dict(
+        cls, data: dict[str, Any], window_id: str | None = None
+    ) -> "WindowState":
+        agent_raw = str(data.get("agent") or data.get("backend") or "")
+        if agent_raw:
+            try:
+                agent = normalize_agent_name(agent_raw)
+            except ValueError:
+                agent = AGENT_CLAUDE
+        elif window_id and is_codex_window_id(window_id):
+            agent = AGENT_CODEX
+        else:
+            # Historical ccbot state predates Codex support, so plain @id
+            # windows without an explicit agent are Claude by default.
+            agent = ""
         return cls(
+            agent=agent,
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
@@ -134,6 +157,39 @@ class SessionManager:
         """Check if a key looks like a tmux window ID (e.g. '@0', '@12')."""
         return key.startswith("@") and len(key) > 1 and key[1:].isdigit()
 
+    def _state_agent(self, window_id: str, state: WindowState | None = None) -> str:
+        """Return the canonical agent for a persisted window state."""
+        if is_codex_window_id(window_id):
+            return AGENT_CODEX
+        if state is None:
+            state = self.window_states.get(window_id)
+        if state and state.agent:
+            try:
+                return normalize_agent_name(state.agent)
+            except ValueError:
+                return AGENT_CLAUDE
+        return AGENT_CLAUDE
+
+    def window_agent(self, window_id: str) -> str:
+        """Return the agent type for a window_id."""
+        return self._state_agent(window_id)
+
+    def is_codex_window(self, window_id: str) -> bool:
+        """Return True when the window is backed by Codex remote control."""
+        return self.window_agent(window_id) == AGENT_CODEX
+
+    def is_claude_window(self, window_id: str) -> bool:
+        """Return True when the window is backed by Claude/tmux control."""
+        return self.window_agent(window_id) == AGENT_CLAUDE
+
+    def has_agent(self, agent: str) -> bool:
+        """Return True if any persisted window state uses the given agent."""
+        normalized = normalize_agent_name(agent)
+        return any(
+            self._state_agent(window_id, state) == normalized
+            for window_id, state in self.window_states.items()
+        )
+
     def _load_state(self) -> None:
         """Load state synchronously during initialization.
 
@@ -144,7 +200,7 @@ class SessionManager:
             try:
                 state = json.loads(config.state_file.read_text())
                 self.window_states = {
-                    k: WindowState.from_dict(v)
+                    k: WindowState.from_dict(v, window_id=k)
                     for k, v in state.get("window_states", {}).items()
                 }
                 self.user_window_offsets = {
@@ -212,6 +268,10 @@ class SessionManager:
         # --- Migrate window_states ---
         new_window_states: dict[str, WindowState] = {}
         for key, ws in self.window_states.items():
+            if self._state_agent(key, ws) == AGENT_CODEX and is_codex_window_id(key):
+                new_window_states[key] = ws
+                continue
+
             if self._is_window_id(key):
                 if key in live_ids:
                     new_window_states[key] = ws
@@ -231,6 +291,14 @@ class SessionManager:
                         self.window_display_names[new_id] = display
                         self.window_display_names.pop(key, None)
                         changed = True
+                    elif self._state_agent(key, ws) == AGENT_CODEX and ws.session_id:
+                        logger.info(
+                            "Preserving missing Codex remote window_state: %s "
+                            "(thread=%s)",
+                            key,
+                            ws.session_id,
+                        )
+                        new_window_states[key] = ws
                     else:
                         logger.info(
                             "Dropping stale window_state: %s (name=%s)", key, display
@@ -256,6 +324,13 @@ class SessionManager:
         for uid, bindings in self.thread_bindings.items():
             new_bindings: dict[int, str] = {}
             for tid, val in bindings.items():
+                val_state = self.window_states.get(val)
+                if self._state_agent(
+                    val, val_state
+                ) == AGENT_CODEX and is_codex_window_id(val):
+                    new_bindings[tid] = val
+                    continue
+
                 if self._is_window_id(val):
                     if val in live_ids:
                         new_bindings[tid] = val
@@ -272,6 +347,20 @@ class SessionManager:
                             new_bindings[tid] = new_id
                             self.window_display_names[new_id] = display
                             changed = True
+                        elif (
+                            self._state_agent(val, self.window_states.get(val))
+                            == AGENT_CODEX
+                            and self.window_states.get(val)
+                            and self.window_states[val].session_id
+                        ):
+                            logger.info(
+                                "Preserving missing Codex remote binding: "
+                                "user=%d, thread=%d, wid=%s",
+                                uid,
+                                tid,
+                                val,
+                            )
+                            new_bindings[tid] = val
                         else:
                             logger.info(
                                 "Dropping stale thread binding: user=%d, thread=%d, wid=%s",
@@ -307,8 +396,21 @@ class SessionManager:
         for uid, offsets in self.user_window_offsets.items():
             new_offsets: dict[str, int] = {}
             for key, offset in offsets.items():
+                if self._state_agent(
+                    key, self.window_states.get(key)
+                ) == AGENT_CODEX and is_codex_window_id(key):
+                    new_offsets[key] = offset
+                    continue
+
                 if self._is_window_id(key):
                     if key in live_ids:
+                        new_offsets[key] = offset
+                    elif (
+                        self._state_agent(key, self.window_states.get(key))
+                        == AGENT_CODEX
+                        and self.window_states.get(key)
+                        and self.window_states[key].session_id
+                    ):
                         new_offsets[key] = offset
                     else:
                         display = self.window_display_names.get(key, key)
@@ -413,6 +515,57 @@ class SessionManager:
             self.window_states[window_id].window_name = new_name
         self._save_state()
         logger.info("Updated display name: window_id %s -> '%s'", window_id, new_name)
+
+    def rebind_window_id(
+        self, old_window_id: str, new_window_id: str, window_name: str = ""
+    ) -> None:
+        """Move all persisted routing state from one window_id to another."""
+        if not old_window_id or not new_window_id:
+            return
+
+        display_name = (
+            window_name
+            or self.window_display_names.get(old_window_id, "")
+            or self.window_display_names.get(new_window_id, "")
+        )
+
+        if old_window_id == new_window_id:
+            if display_name:
+                self.window_display_names[new_window_id] = display_name
+                self.get_window_state(new_window_id).window_name = display_name
+                self._save_state()
+            return
+
+        old_state = self.window_states.pop(old_window_id, None)
+        new_state = self.window_states.get(new_window_id)
+        if old_state:
+            if display_name:
+                old_state.window_name = display_name
+            self.window_states[new_window_id] = old_state
+        elif new_state and display_name:
+            new_state.window_name = display_name
+
+        old_display = self.window_display_names.pop(old_window_id, "")
+        if display_name or old_display:
+            self.window_display_names[new_window_id] = display_name or old_display
+
+        for bindings in self.thread_bindings.values():
+            for thread_id, wid in list(bindings.items()):
+                if wid == old_window_id:
+                    bindings[thread_id] = new_window_id
+
+        for offsets in self.user_window_offsets.values():
+            if old_window_id in offsets:
+                old_offset = offsets.pop(old_window_id)
+                offsets[new_window_id] = max(offsets.get(new_window_id, 0), old_offset)
+
+        self._save_state()
+        logger.info(
+            "Rebound persisted window state: %s -> %s (name=%s)",
+            old_window_id,
+            new_window_id,
+            display_name,
+        )
 
     # --- Group chat ID management (supergroup forum topic routing) ---
 
@@ -531,6 +684,9 @@ class SessionManager:
             if not new_sid:
                 continue
             state = self.get_window_state(window_id)
+            if state.agent != AGENT_CLAUDE:
+                state.agent = AGENT_CLAUDE
+                changed = True
             if state.session_id != new_sid or state.cwd != new_cwd:
                 logger.info(
                     "Session map: window_id %s updated sid=%s, cwd=%s",
@@ -549,7 +705,11 @@ class SessionManager:
                     changed = True
 
         # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
+        stale_wids = [
+            w
+            for w, state in self.window_states.items()
+            if w and w not in valid_wids and self._state_agent(w, state) != AGENT_CODEX
+        ]
         for wid in stale_wids:
             logger.info("Removing stale window_state: %s", wid)
             del self.window_states[wid]
@@ -565,6 +725,26 @@ class SessionManager:
         if window_id not in self.window_states:
             self.window_states[window_id] = WindowState()
         return self.window_states[window_id]
+
+    def bind_codex_thread(
+        self, user_id: int, thread_id: int, codex_thread_id: str, cwd: str, name: str
+    ) -> str:
+        """Bind a Telegram topic to a legacy Codex pseudo-window.
+
+        New Codex remote sessions bind topics to real tmux `@id` windows and
+        store the Codex thread id on WindowState. This helper remains for
+        existing persisted pseudo-window state and unit coverage.
+        """
+        window_id = make_codex_window_id(codex_thread_id)
+        state = self.get_window_state(window_id)
+        state.agent = AGENT_CODEX
+        state.session_id = codex_thread_id
+        state.cwd = cwd
+        state.window_name = name
+        self.bind_thread(
+            user_id, thread_id, window_id, window_name=name, agent=AGENT_CODEX
+        )
+        return window_id
 
     def clear_window_session(self, window_id: str) -> None:
         """Clear session association for a window (e.g., after /clear command)."""
@@ -589,10 +769,101 @@ class SessionManager:
         encoded_cwd = self._encode_cwd(cwd)
         return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
 
+    def _find_codex_session_file(self, session_id: str) -> Path | None:
+        """Find a Codex session JSONL file by thread id."""
+        if not session_id or not config.codex_sessions_path.exists():
+            return None
+        pattern = f"rollout-*-{session_id}.jsonl"
+        matches = list(config.codex_sessions_path.rglob(pattern))
+        if not matches:
+            return None
+        return max(matches, key=lambda p: p.stat().st_mtime)
+
+    @staticmethod
+    def _read_codex_session_cwd(file_path: Path) -> str:
+        """Read cwd from the first Codex `session_meta` entry."""
+        try:
+            with file_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    data = json.loads(line)
+                    if data.get("type") != "session_meta":
+                        continue
+                    payload = data.get("payload")
+                    if isinstance(payload, dict):
+                        return str(payload.get("cwd") or "")
+                    return ""
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return ""
+
+    def _load_codex_session_index(self) -> dict[str, str]:
+        """Load Codex thread names from session_index.jsonl."""
+        index: dict[str, str] = {}
+        index_file = config.codex_session_index_file
+        if not index_file.exists():
+            return index
+        try:
+            with index_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    data = json.loads(line)
+                    sid = str(data.get("id") or "")
+                    name = str(data.get("thread_name") or "")
+                    if sid and name:
+                        index[sid] = name
+        except (OSError, json.JSONDecodeError):
+            return index
+        return index
+
+    async def _get_codex_session_direct(
+        self, session_id: str, cwd: str = ""
+    ) -> ClaudeSession | None:
+        """Get session metadata from Codex's JSONL rollout files."""
+        file_path = self._find_codex_session_file(session_id)
+        if not file_path:
+            return None
+
+        summary = self._load_codex_session_index().get(session_id, "")
+        last_user_msg = ""
+        message_count = 0
+        try:
+            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                async for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = TranscriptParser.parse_line(line)
+                    if not data:
+                        continue
+                    if data.get("type") == "session_meta" and cwd:
+                        payload = data.get("payload")
+                        if isinstance(payload, dict) and payload.get("cwd") != cwd:
+                            return None
+                    parsed = TranscriptParser.parse_message(data)
+                    if parsed and parsed.text.strip():
+                        message_count += 1
+                        if parsed.message_type == "user":
+                            last_user_msg = parsed.text.strip()
+        except OSError:
+            return None
+
+        if not summary:
+            summary = last_user_msg[:50] if last_user_msg else "Untitled"
+
+        return ClaudeSession(
+            session_id=session_id,
+            summary=summary,
+            message_count=message_count,
+            file_path=str(file_path),
+        )
+
     async def _get_session_direct(
         self, session_id: str, cwd: str
     ) -> ClaudeSession | None:
-        """Get a ClaudeSession directly from session_id and cwd (no scanning)."""
+        """Get a Claude session directly from session_id and cwd (no scanning)."""
         file_path = self._build_session_file_path(session_id, cwd)
 
         # Fallback: glob search if direct path doesn't exist
@@ -645,15 +916,20 @@ class SessionManager:
 
     # --- Directory session listing ---
 
-    async def list_sessions_for_directory(self, cwd: str) -> list[ClaudeSession]:
-        """List existing Claude sessions for a directory.
+    async def list_sessions_for_directory(
+        self, cwd: str, agent: str | None = None
+    ) -> list[ClaudeSession]:
+        """List existing agent sessions for a directory.
 
-        Encodes the cwd path to find the project directory under
-        ~/.claude/projects/{encoded_cwd}/, globs *.jsonl files, and
-        extracts summary info from each.
+        Claude sessions are read from ~/.claude/projects/{encoded_cwd}/.
+        Codex sessions are read from ~/.codex/sessions rollout files.
 
         Returns a list sorted by mtime (most recent first), capped at 10.
         """
+        selected_agent = normalize_agent_name(agent or config.default_agent)
+        if selected_agent == AGENT_CODEX:
+            return await self._list_codex_sessions_for_directory(cwd)
+
         encoded_cwd = self._encode_cwd(cwd)
         project_dir = config.claude_projects_path / encoded_cwd
         if not project_dir.is_dir():
@@ -679,6 +955,50 @@ class SessionManager:
                 sessions.append(session)
         return sessions
 
+    async def _list_codex_sessions_for_directory(self, cwd: str) -> list[ClaudeSession]:
+        """List existing Codex sessions for a directory."""
+        try:
+            target = str(Path(cwd).expanduser().resolve())
+        except (OSError, ValueError):
+            target = cwd
+
+        if not config.codex_sessions_path.exists():
+            return []
+
+        index = self._load_codex_session_index()
+        files = sorted(
+            config.codex_sessions_path.rglob("rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        sessions: list[ClaudeSession] = []
+        for file_path in files:
+            if len(sessions) >= 10:
+                break
+            file_cwd = await asyncio.to_thread(self._read_codex_session_cwd, file_path)
+            if not file_cwd:
+                continue
+            try:
+                norm_cwd = str(Path(file_cwd).resolve())
+            except (OSError, ValueError):
+                norm_cwd = file_cwd
+            if norm_cwd != target:
+                continue
+
+            stem = file_path.stem
+            session_id = stem.rsplit("-", 1)[-1]
+            if len(session_id) < 32 and stem.startswith("rollout-"):
+                # UUIDs contain dashes; strip the fixed rollout timestamp prefix.
+                parts = stem.split("-")
+                session_id = "-".join(parts[-5:])
+            session = await self._get_codex_session_direct(session_id, target)
+            if session:
+                if session.summary == "Untitled":
+                    session.summary = index.get(session_id, session.summary)
+                sessions.append(session)
+        return sessions
+
     # --- Window → Session resolution ---
 
     async def resolve_session_for_window(self, window_id: str) -> ClaudeSession | None:
@@ -688,6 +1008,14 @@ class SessionManager:
         Returns None if no session is associated with this window.
         """
         state = self.get_window_state(window_id)
+
+        if self.is_codex_window(window_id):
+            session_id = state.session_id
+            if not session_id and is_codex_window_id(window_id):
+                session_id = codex_thread_id_from_window_id(window_id)
+            if not session_id:
+                return None
+            return await self._get_codex_session_direct(session_id, state.cwd)
 
         if not state.session_id or not state.cwd:
             return None
@@ -722,7 +1050,12 @@ class SessionManager:
     # --- Thread binding management ---
 
     def bind_thread(
-        self, user_id: int, thread_id: int, window_id: str, window_name: str = ""
+        self,
+        user_id: int,
+        thread_id: int,
+        window_id: str,
+        window_name: str = "",
+        agent: str = "",
     ) -> None:
         """Bind a Telegram topic thread to a tmux window.
 
@@ -731,12 +1064,19 @@ class SessionManager:
             thread_id: Telegram topic thread ID
             window_id: Tmux window ID (e.g. '@0')
             window_name: Display name for the window (optional)
+            agent: Agent type for this window (optional)
         """
         if user_id not in self.thread_bindings:
             self.thread_bindings[user_id] = {}
         self.thread_bindings[user_id][thread_id] = window_id
+        state = self.get_window_state(window_id)
+        if agent:
+            state.agent = normalize_agent_name(agent)
+        elif is_codex_window_id(window_id):
+            state.agent = AGENT_CODEX
         if window_name:
             self.window_display_names[window_id] = window_name
+            state.window_name = window_name
         self._save_state()
         display = window_name or self.get_display_name(window_id)
         logger.info(
@@ -797,13 +1137,17 @@ class SessionManager:
     async def find_users_for_session(
         self,
         session_id: str,
+        agent: str | None = None,
     ) -> list[tuple[int, str, int]]:
         """Find all users whose thread-bound window maps to the given session_id.
 
         Returns list of (user_id, window_id, thread_id) tuples.
         """
+        selected_agent = normalize_agent_name(agent) if agent else None
         result: list[tuple[int, str, int]] = []
         for user_id, thread_id, window_id in self.iter_thread_bindings():
+            if selected_agent and self.window_agent(window_id) != selected_agent:
+                continue
             resolved = await self.resolve_session_for_window(window_id)
             if resolved and resolved.session_id == session_id:
                 result.append((user_id, window_id, thread_id))
@@ -813,6 +1157,17 @@ class SessionManager:
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:
         """Send text to a tmux window by ID."""
+        if self.is_codex_window(window_id):
+            from .codex_remote import codex_remote_manager
+
+            state = self.get_window_state(window_id)
+            thread_id = state.session_id
+            if is_codex_window_id(window_id):
+                thread_id = thread_id or codex_thread_id_from_window_id(window_id)
+            if not thread_id:
+                return False, "Missing Codex thread id for bound window"
+            return await codex_remote_manager.send_to_thread(thread_id, text)
+
         display = self.get_display_name(window_id)
         logger.debug(
             "send_to_window: window_id=%s (%s), text_len=%d",

@@ -1,8 +1,13 @@
 """Tests for SessionManager pure dict operations."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 
-from ccbot.session import SessionManager
+from ccbot import session as session_module
+from ccbot.codex_remote import make_codex_window_id
+from ccbot.config import AGENT_CLAUDE, AGENT_CODEX
+from ccbot.session import SessionManager, WindowState
 
 
 @pytest.fixture
@@ -95,6 +100,7 @@ class TestWindowState:
         state = mgr.get_window_state("@0")
         assert state.session_id == ""
         assert state.cwd == ""
+        assert mgr.window_agent("@0") == AGENT_CLAUDE
 
     def test_get_returns_existing(self, mgr: SessionManager) -> None:
         state = mgr.get_window_state("@1")
@@ -106,6 +112,25 @@ class TestWindowState:
         state.session_id = "abc"
         mgr.clear_window_session("@1")
         assert mgr.get_window_state("@1").session_id == ""
+
+    def test_window_state_serializes_agent(self) -> None:
+        state = WindowState(
+            agent=AGENT_CODEX,
+            session_id="sid",
+            cwd="/tmp/project",
+            window_name="project",
+        )
+        restored = WindowState.from_dict(state.to_dict(), window_id="@1")
+        assert restored.agent == AGENT_CODEX
+
+    def test_missing_agent_defaults_to_claude(self, mgr: SessionManager) -> None:
+        state = WindowState.from_dict(
+            {"session_id": "sid", "cwd": "/tmp/project"},
+            window_id="@1",
+        )
+        assert state.agent == ""
+        mgr.window_states["@1"] = state
+        assert mgr.window_agent("@1") == AGENT_CLAUDE
 
 
 class TestResolveWindowForThread:
@@ -142,6 +167,82 @@ class TestDisplayNames:
         mgr.bind_thread(100, 1, "@1")
         # No display name set, fallback to window_id
         assert mgr.get_display_name("@1") == "@1"
+
+    def test_bind_codex_thread_sets_state_and_display(
+        self, mgr: SessionManager
+    ) -> None:
+        window_id = mgr.bind_codex_thread(
+            100,
+            1,
+            "019e459d-c98d-7223-85b5-de7c290f859e",
+            "/tmp/project",
+            "project",
+        )
+        assert window_id == make_codex_window_id("019e459d-c98d-7223-85b5-de7c290f859e")
+        assert mgr.get_window_for_thread(100, 1) == window_id
+        assert mgr.get_display_name(window_id) == "project"
+        assert mgr.get_window_state(window_id).cwd == "/tmp/project"
+        assert mgr.get_window_state(window_id).agent == AGENT_CODEX
+
+
+class TestWindowRebinding:
+    def test_rebind_window_id_moves_all_persisted_state(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.window_states["@1"] = WindowState(
+            session_id="sid",
+            cwd="/tmp/project",
+            window_name="old",
+        )
+        mgr.window_display_names["@1"] = "old"
+        mgr.thread_bindings[100] = {1: "@1", 2: "@2"}
+        mgr.user_window_offsets[100] = {"@1": 25, "@2": 5}
+
+        mgr.rebind_window_id("@1", "@9", "new")
+
+        assert "@1" not in mgr.window_states
+        assert mgr.window_states["@9"].session_id == "sid"
+        assert mgr.window_states["@9"].cwd == "/tmp/project"
+        assert mgr.window_states["@9"].window_name == "new"
+        assert mgr.thread_bindings[100] == {1: "@9", 2: "@2"}
+        assert mgr.user_window_offsets[100] == {"@9": 25, "@2": 5}
+        assert mgr.window_display_names["@9"] == "new"
+
+    async def test_resolve_stale_ids_preserves_missing_codex_remote_window(
+        self, monkeypatch, mgr: SessionManager
+    ) -> None:
+        monkeypatch.setattr(
+            session_module.tmux_manager,
+            "list_windows",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            mgr,
+            "_cleanup_stale_session_map_entries",
+            AsyncMock(),
+        )
+        monkeypatch.setattr(
+            mgr,
+            "_cleanup_old_format_session_map_keys",
+            AsyncMock(),
+        )
+        mgr.window_states["@1"] = WindowState(
+            agent=AGENT_CODEX,
+            session_id="019e459d-c98d-7223-85b5-de7c290f859e",
+            cwd="/tmp/project",
+            window_name="project",
+        )
+        mgr.window_display_names["@1"] = "project"
+        mgr.thread_bindings[100] = {1: "@1"}
+        mgr.user_window_offsets[100] = {"@1": 25}
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.window_states["@1"].session_id == (
+            "019e459d-c98d-7223-85b5-de7c290f859e"
+        )
+        assert mgr.thread_bindings[100] == {1: "@1"}
+        assert mgr.user_window_offsets[100] == {"@1": 25}
 
 
 class TestIsWindowId:

@@ -7,22 +7,57 @@ TARGET="${TMUX_SESSION}:${TMUX_WINDOW}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MAX_WAIT=10  # seconds to wait for process to exit
 
-# Check if tmux session and window exist
+# Ensure tmux session and window exist
 if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    echo "Error: tmux session '$TMUX_SESSION' does not exist"
-    exit 1
+    echo "Tmux session '$TMUX_SESSION' does not exist, creating it..."
+    tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$PROJECT_DIR"
 fi
 
 if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$TMUX_WINDOW"; then
-    echo "Error: window '$TMUX_WINDOW' not found in session '$TMUX_SESSION'"
-    exit 1
+    echo "Window '$TMUX_WINDOW' not found in session '$TMUX_SESSION', creating it..."
+    tmux new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW" -c "$PROJECT_DIR"
 fi
 
 # Get the pane PID and check if uv run ccbot is running
 PANE_PID=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}')
 
+descendant_pids() {
+    local root="$1"
+    local frontier="$root"
+    local children
+
+    while [ -n "$frontier" ]; do
+        local next=""
+        for pid in $frontier; do
+            children=$(pgrep -P "$pid" 2>/dev/null || true)
+            if [ -n "$children" ]; then
+                echo "$children"
+                next="$next $children"
+            fi
+        done
+        frontier="$next"
+    done
+}
+
 is_ccbot_running() {
-    pstree -a "$PANE_PID" 2>/dev/null | grep -q 'uv.*run ccbot\|ccbot.*\.venv/bin/ccbot'
+    local pid cmd
+    for pid in $(descendant_pids "$PANE_PID"); do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        case "$cmd" in
+            *"uv run ccbot"*|*"/ccbot"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+find_uv_pid() {
+    local pid cmd
+    for pid in $(descendant_pids "$PANE_PID"); do
+        cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        case "$cmd" in
+            *"uv run ccbot"*) echo "$pid"; return 0 ;;
+        esac
+    done
 }
 
 # Stop existing process if running
@@ -41,7 +76,7 @@ if is_ccbot_running; then
     if is_ccbot_running; then
         echo "Process did not exit after ${MAX_WAIT}s, sending SIGTERM..."
         # Kill the uv process directly
-        UV_PID=$(pstree -ap "$PANE_PID" 2>/dev/null | grep -oP 'uv,\K\d+' | head -1)
+        UV_PID=$(find_uv_pid)
         if [ -n "$UV_PID" ]; then
             kill "$UV_PID" 2>/dev/null || true
             sleep 2

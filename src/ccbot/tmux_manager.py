@@ -370,14 +370,16 @@ class TmuxManager:
         window_name: str | None = None,
         start_claude: bool = True,
         resume_session_id: str | None = None,
+        command: str | None = None,
     ) -> tuple[bool, str, str, str]:
-        """Create a new tmux window and optionally start Claude Code.
+        """Create a new tmux window and optionally start an agent command.
 
         Args:
             work_dir: Working directory for the new window
             window_name: Optional window name (defaults to directory name)
-            start_claude: Whether to start claude command
+            start_claude: Whether to start the configured/default agent command
             resume_session_id: If set, append --resume <id> to claude command
+            command: Explicit shell command to start instead of claude_command
 
         Returns:
             Tuple of (success, message, window_name, window_id)
@@ -418,8 +420,8 @@ class TmuxManager:
                 if start_claude:
                     pane = window.active_pane
                     if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
+                        cmd = command or config.claude_command
+                        if resume_session_id and command is None:
                             cmd = f"{cmd} --resume {resume_session_id}"
                         pane.send_keys(cmd, enter=True)
 

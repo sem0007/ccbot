@@ -1331,7 +1331,15 @@ async def _create_and_bind_window(
             thread = await codex_remote_manager.create_thread(
                 selected_path, resume_thread_id=resume_session_id
             )
-            if not await codex_remote_manager.wait_until_resumable(thread.thread_id):
+            # Newly started app-server threads are kept in memory until the
+            # first user message materializes the JSONL rollout. Remote TUI
+            # clients can still attach to that loaded thread directly.
+            if (
+                resume_session_id
+                and not await codex_remote_manager.wait_until_resumable(
+                    thread.thread_id
+                )
+            ):
                 raise RuntimeError(
                     "Codex thread was created, but its local session file was "
                     "not visible before the tmux resume timeout"

@@ -10,6 +10,8 @@ Key class: Config (singleton instantiated as `config`).
 
 import logging
 import os
+import shlex
+import shutil
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -42,6 +44,40 @@ def normalize_agent_name(value: str, *, var_name: str = "agent") -> str:
             f"{var_name} must be one of {sorted(VALID_AGENTS)}, got {value!r}"
         )
     return normalized
+
+
+def _looks_like_env_assignment(token: str) -> bool:
+    name, sep, _value = token.partition("=")
+    if not sep or not name or name[0].isdigit():
+        return False
+    return all(c.isalnum() or c == "_" for c in name)
+
+
+def _command_executable(command: str) -> str:
+    """Extract the executable from a simple shell command."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+
+    while parts:
+        token = parts.pop(0)
+        if token == "env":
+            continue
+        if _looks_like_env_assignment(token):
+            continue
+        return token
+    return ""
+
+
+def _command_exists(command: str) -> bool:
+    executable = _command_executable(command)
+    if not executable:
+        return False
+    if "/" in executable:
+        path = Path(executable).expanduser()
+        return path.is_file() and os.access(path, os.X_OK)
+    return shutil.which(executable) is not None
 
 
 class Config:
@@ -80,10 +116,9 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
-        self.default_agent = normalize_agent_name(
-            os.getenv("CCBOT_DEFAULT_AGENT", AGENT_CLAUDE),
-            var_name="CCBOT_DEFAULT_AGENT",
-        )
+        # Agent commands to run in new tmux windows or remote app-server mode.
+        self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
+        self.codex_command = os.getenv("CODEX_COMMAND", "codex")
 
         enabled_agents_raw = os.getenv("CCBOT_ENABLED_AGENTS")
         if enabled_agents_raw:
@@ -97,7 +132,18 @@ class Config:
             if not enabled_agents:
                 raise ValueError("CCBOT_ENABLED_AGENTS must contain at least one agent")
         else:
-            enabled_agents = [AGENT_CLAUDE]
+            enabled_agents = self._detect_enabled_agents()
+
+        default_agent_raw = os.getenv("CCBOT_DEFAULT_AGENT")
+        if default_agent_raw:
+            self.default_agent = normalize_agent_name(
+                default_agent_raw,
+                var_name="CCBOT_DEFAULT_AGENT",
+            )
+        elif AGENT_CLAUDE in enabled_agents:
+            self.default_agent = AGENT_CLAUDE
+        else:
+            self.default_agent = enabled_agents[0]
 
         if self.default_agent not in enabled_agents:
             raise ValueError(
@@ -108,10 +154,6 @@ class Config:
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
         self.tmux_main_window_name = "__main__"
-
-        # Agent commands to run in new tmux windows or remote app-server mode.
-        self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
-        self.codex_command = os.getenv("CODEX_COMMAND", "codex")
 
         # Codex app-server remote transport configuration. This uses the
         # official app-server JSON-RPC protocol over WebSocket so tmux-hosted
@@ -200,6 +242,24 @@ class Config:
             self.tmux_session_name,
             self.claude_projects_path,
         )
+
+    def _detect_enabled_agents(self) -> list[str]:
+        """Auto-enable installed agents when CCBOT_ENABLED_AGENTS is unset."""
+        enabled_agents: list[str] = []
+        if _command_exists(self.claude_command):
+            enabled_agents.append(AGENT_CLAUDE)
+        if _command_exists(self.codex_command):
+            enabled_agents.append(AGENT_CODEX)
+        if enabled_agents:
+            return enabled_agents
+
+        logger.warning(
+            "No agent commands detected from CLAUDE_COMMAND=%r or CODEX_COMMAND=%r; "
+            "falling back to Claude.",
+            self.claude_command,
+            self.codex_command,
+        )
+        return [AGENT_CLAUDE]
 
     def is_user_allowed(self, user_id: int) -> bool:
         """Check if a user is in the allowed list."""

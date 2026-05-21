@@ -90,7 +90,10 @@ ALLOWED_USERS=your_telegram_user_id
 | ---------- | ------------ | -------- |
 | `CCBOT_DIR` | `~/.ccbot` | Каталог конфигурации/состояния (`.env` грузится отсюда) |
 | `TMUX_SESSION_NAME` | `ccbot` | Имя tmux-сессии |
+| `CCBOT_ENABLED_AGENTS` | автообнаружение | Агенты через запятую (`claude`, `codex`); если не задано, проверяются локальные команды |
+| `CCBOT_DEFAULT_AGENT` | `claude`, если доступен | Агент по умолчанию для сценариев с одним агентом |
 | `CLAUDE_COMMAND` | `claude` | Команда запуска в новых окнах |
+| `CODEX_COMMAND` | `codex` | Команда Codex для remote-сессий |
 | `MONITOR_POLL_INTERVAL` | `2.0` | Интервал опроса в секундах |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Показывать скрытые (dot) директории в браузере каталогов |
 | `OPENAI_API_KEY` | _(нет)_ | API-ключ OpenAI для транскрипции голосовых сообщений |

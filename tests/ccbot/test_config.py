@@ -7,6 +7,13 @@ import pytest
 from ccbot.config import AGENT_CLAUDE, AGENT_CODEX, Config
 
 
+def _install_fake_command(bin_dir: Path, name: str) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    command = bin_dir / name
+    command.write_text("#!/bin/sh\nexit 0\n")
+    command.chmod(0o755)
+
+
 @pytest.fixture
 def _base_env(monkeypatch, tmp_path):
     # chdir to tmp_path so load_dotenv won't find the real .env in repo root
@@ -16,6 +23,9 @@ def _base_env(monkeypatch, tmp_path):
     monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
     monkeypatch.delenv("CCBOT_DEFAULT_AGENT", raising=False)
     monkeypatch.delenv("CCBOT_ENABLED_AGENTS", raising=False)
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
 
 
 @pytest.mark.usefixtures("_base_env")
@@ -46,6 +56,39 @@ class TestConfigValid:
     def test_default_agent(self):
         cfg = Config()
         assert cfg.default_agent == AGENT_CLAUDE
+        assert cfg.enabled_agents == (AGENT_CLAUDE,)
+
+    def test_auto_detects_available_agent_commands(self, monkeypatch, tmp_path):
+        bin_dir = tmp_path / "bin"
+        _install_fake_command(bin_dir, "claude")
+        _install_fake_command(bin_dir, "codex")
+        monkeypatch.setenv("PATH", str(bin_dir))
+
+        cfg = Config()
+
+        assert cfg.default_agent == AGENT_CLAUDE
+        assert cfg.enabled_agents == (AGENT_CLAUDE, AGENT_CODEX)
+
+    def test_auto_detects_codex_only_and_defaults_to_codex(self, monkeypatch, tmp_path):
+        bin_dir = tmp_path / "bin"
+        _install_fake_command(bin_dir, "codex")
+        monkeypatch.setenv("PATH", str(bin_dir))
+
+        cfg = Config()
+
+        assert cfg.default_agent == AGENT_CODEX
+        assert cfg.enabled_agents == (AGENT_CODEX,)
+
+    def test_auto_detection_handles_env_prefixed_commands(self, monkeypatch, tmp_path):
+        bin_dir = tmp_path / "bin"
+        _install_fake_command(bin_dir, "claude")
+        monkeypatch.setenv("PATH", str(bin_dir))
+        monkeypatch.setenv(
+            "CLAUDE_COMMAND", "IS_SANDBOX=1 claude --dangerously-skip-permissions"
+        )
+
+        cfg = Config()
+
         assert cfg.enabled_agents == (AGENT_CLAUDE,)
 
     def test_codex_agent_config(self, monkeypatch):

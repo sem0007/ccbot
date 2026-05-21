@@ -89,7 +89,10 @@ ALLOWED_USERS=your_telegram_user_id
 |---|---|---|
 | `CCBOT_DIR` | `~/.ccbot` | 配置/状态目录（`.env` 从此目录加载） |
 | `TMUX_SESSION_NAME` | `ccbot` | tmux 会话名称 |
+| `CCBOT_ENABLED_AGENTS` | 自动检测 | 逗号分隔的 agent（`claude`, `codex`）；未配置时检测本地命令 |
+| `CCBOT_DEFAULT_AGENT` | 优先 `claude` | 单 agent 流程使用的默认 agent |
 | `CLAUDE_COMMAND` | `claude` | 新窗口中运行的命令 |
+| `CODEX_COMMAND` | `codex` | Codex remote session 使用的命令 |
 | `MONITOR_POLL_INTERVAL` | `2.0` | 轮询间隔（秒） |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | 在目录浏览器中显示隐藏（点开头）目录 |
 | `OPENAI_API_KEY` | _(无)_ | OpenAI API 密钥，用于语音消息转录 |

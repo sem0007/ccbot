@@ -92,7 +92,10 @@ ALLOWED_USERS=your_telegram_user_id
 | ----------------------- | ---------- | ------------------------------------------------ |
 | `CCBOT_DIR`             | `~/.ccbot` | Config/state directory (`.env` loaded from here) |
 | `TMUX_SESSION_NAME`     | `ccbot`    | Tmux session name                                |
+| `CCBOT_ENABLED_AGENTS`  | auto-detect | Comma-separated agents (`claude`, `codex`); when unset, installed commands are detected |
+| `CCBOT_DEFAULT_AGENT`   | `claude` if available | Default agent for single-agent flows |
 | `CLAUDE_COMMAND`        | `claude`   | Command to run in new windows                    |
+| `CODEX_COMMAND`         | `codex`    | Codex command used for remote sessions           |
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |

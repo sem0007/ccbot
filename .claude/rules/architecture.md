@@ -6,10 +6,10 @@
 │  - Topic-based routing: 1 topic = 1 window = 1 session             │
 │  - /history: Paginated message history (default: latest page)      │
 │  - /screenshot: Capture tmux pane as PNG                           │
-│  - /esc: Send Escape to interrupt Claude                           │
-│  - Send text → Claude Code via tmux keystrokes                     │
-│  - Forward /commands to Claude Code                                │
-│  - Create sessions via directory browser in unbound topics         │
+│  - /esc: Interrupt active agent                                    │
+│  - Send text → Claude via tmux, Codex via app-server               │
+│  - Forward /commands to the active agent                           │
+│  - Create sessions via agent picker + directory browser            │
 │  - Tool use → tool result: edit message in-place                   │
 │  - Interactive UI: AskUserQuestion / ExitPlanMode / Permission     │
 │  - Per-user message queue + worker (merge, rate limit)             │
@@ -39,12 +39,12 @@
            ▼                                  ▼
 ┌────────────────────────┐         ┌─────────────────────────┐
 │  TranscriptParser      │         │  Tmux Windows           │
-│  (transcript_parser.py)│         │  - Claude Code process  │
+│  (transcript_parser.py)│         │  - Claude Code / Codex  │
 │  - Parse JSONL entries │         │  - One window per       │
 │  - Pair tool_use ↔     │         │    topic/session        │
 │    tool_result         │         └────────────┬────────────┘
 │  - Format expandable   │                      │
-│    quotes for thinking │              SessionStart hook
+│    quotes for thinking │          Claude hook / Codex RPC
 │  - Extract history     │                      │
 └────────────────────────┘                      ▼
                                     ┌────────────────────────┐
@@ -55,9 +55,9 @@
 │    resolution          │         └────────────────────────┘
 │  - Thread bindings     │
 │    (topic → window)    │         ┌────────────────────────┐
-│  - Message history     │────────►│  Claude Sessions       │
+│  - Message history     │────────►│  Agent Session Files   │
 │    retrieval           │  reads  │  ~/.claude/projects/   │
-└────────────────────────┘  JSONL  │  - sessions-index      │
+└────────────────────────┘  JSONL  │  ~/.codex/sessions/    │
                                    │  - *.jsonl files       │
 ┌────────────────────────┐         └────────────────────────┘
 │  MonitorState          │
@@ -70,6 +70,7 @@
 Additional modules:
   screenshot.py       ─ Terminal text → PNG rendering (ANSI color, font fallback)
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
+  codex_remote.py     ─ Codex app-server JSON-RPC transport + TUI attach command
   main.py             ─ CLI entry point
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
 
@@ -85,18 +86,19 @@ Handler modules (handlers/):
 
 State files (~/.ccbot/ or $CCBOT_DIR/):
   state.json         ─ thread bindings + window states + display names + read offsets
-  session_map.json   ─ hook-generated window_id→session mapping
+  session_map.json   ─ Claude hook-generated window_id→session mapping
   monitor_state.json ─ poll progress (byte offset) per JSONL file
+  ~/.codex/sessions  ─ Codex rollout JSONL files
 ```
 
 ## Key Design Decisions
 
-- **Topic-centric** — Each Telegram topic binds to one tmux window. No centralized session list; topics *are* the session list.
+- **Topic-centric** — Each Telegram topic binds to one tmux window and one agent session. No centralized session list; topics *are* the session list.
 - **Window ID-centric** — All internal state keyed by tmux window ID (e.g. `@0`, `@12`), not window names. Window IDs are guaranteed unique within a tmux server session. Window names are kept as display names via `window_display_names` map. Same directory can have multiple windows.
-- **Hook-based session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; monitor reads it each poll cycle to auto-detect session changes.
+- **Agent-aware session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; Codex remote sessions store the Codex thread id on `WindowState` and stream via app-server notifications.
 - **Tool use ↔ tool result pairing** — `tool_use_id` tracked across poll cycles; tool result edits the original tool_use Telegram message in-place.
 - **MarkdownV2 with fallback** — All messages go through `safe_reply`/`safe_edit`/`safe_send` which convert via `telegramify-markdown` and fall back to plain text on parse failure.
 - **No truncation at parse layer** — Full content preserved; splitting at send layer respects Telegram's 4096 char limit with expandable quote atomicity.
-- Only sessions registered in `session_map.json` (via hook) are monitored.
+- Claude sessions registered in `session_map.json` are monitored from JSONL; Codex sessions are monitored through app-server notifications and read from Codex rollout files for history.
 - Notifications delivered to users via thread bindings (topic → window_id → session).
 - **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.

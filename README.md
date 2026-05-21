@@ -3,43 +3,44 @@
 [中文文档](README_CN.md)
 [Русская документация](README_RU.md)
 
-Control Claude Code sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in tmux.
+Control Claude Code and Codex sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in tmux.
 
 https://github.com/user-attachments/assets/15ffb38e-5eb9-4720-93b9-412e4961dc93
 
 ## Why CCBot?
 
-Claude Code runs in your terminal. When you step away from your computer — commuting, on the couch, or just away from your desk — the session keeps working, but you lose visibility and control.
+Claude Code and Codex run as local agent CLIs. When you step away from your computer — commuting, on the couch, or just away from your desk — the session keeps working, but you lose visibility and control.
 
-CCBot solves this by letting you **seamlessly continue the same session from Telegram**. The key insight is that it operates on **tmux**, not the Claude Code SDK. Your Claude Code process stays exactly where it is, in a tmux window on your machine. CCBot simply reads its output and sends keystrokes to it. This means:
+CCBot solves this by letting you **seamlessly continue the same session from Telegram**. The key insight is that it keeps a terminal-backed session as the source of truth. Claude Code runs directly in a tmux window with hook-based tracking; Codex runs through its app-server remote protocol with a tmux-hosted TUI attached to the same thread. This means:
 
-- **Switch from desktop to phone mid-conversation** — Claude is working on a refactor? Walk away, keep monitoring and responding from Telegram.
+- **Switch from desktop to phone mid-conversation** — Claude or Codex is working on a refactor? Walk away, keep monitoring and responding from Telegram.
 - **Switch back to desktop anytime** — Since the tmux session was never interrupted, just `tmux attach` and you're back in the terminal with full scrollback and context.
 - **Run multiple sessions in parallel** — Each Telegram topic maps to a separate tmux window, so you can juggle multiple projects from one chat group.
 
-Other Telegram bots for Claude Code typically wrap the Claude Code SDK to create separate API sessions. Those sessions are isolated — you can't resume them in your terminal. CCBot takes a different approach: it's just a thin control layer over tmux, so the terminal remains the source of truth and you never lose the ability to switch back.
+Other Telegram bots for coding agents typically create separate API sessions. Those sessions are isolated — you can't resume them in your terminal. CCBot takes a different approach: it supports Claude Code through tmux + hooks and Codex through remote app-server threads, while preserving a terminal UI you can return to.
 
-In fact, CCBot itself was built this way — iterating on itself through Claude Code sessions monitored and driven from Telegram via CCBot.
+In fact, CCBot itself was built this way — iterating on itself through agent sessions monitored and driven from Telegram via CCBot.
 
 ## Features
 
-- **Topic-based sessions** — Each Telegram topic maps 1:1 to a tmux window and Claude session
-- **Real-time notifications** — Get Telegram messages for assistant responses, thinking content, tool use/result, and local command output
+- **Claude Code and Codex support** — Use either agent, or enable both and choose per topic
+- **Topic-based sessions** — Each Telegram topic maps 1:1 to a tmux window and agent session
+- **Real-time notifications** — Get Telegram messages for agent responses, thinking content, tool use/result, and local command output
 - **Interactive UI** — Navigate AskUserQuestion, ExitPlanMode, and Permission Prompts via inline keyboard
 - **Voice messages** — Voice messages are transcribed via OpenAI and forwarded as text
-- **Send messages** — Forward text to Claude Code via tmux keystrokes
-- **Slash command forwarding** — Send any `/command` directly to Claude Code (e.g. `/clear`, `/compact`, `/cost`)
-- **Create new sessions** — Start Claude Code sessions from Telegram via directory browser
-- **Resume sessions** — Pick up where you left off by resuming an existing Claude session in a directory
+- **Send messages** — Forward text to the active agent (Claude via tmux, Codex via remote app-server)
+- **Slash command forwarding** — Send any `/command` directly to the active agent (e.g. `/clear`, `/compact`, `/cost`)
+- **Create new sessions** — Start Claude Code or Codex sessions from Telegram via directory browser
+- **Resume sessions** — Pick up where you left off by resuming an existing Claude or Codex session in a directory
 - **Kill sessions** — Close a topic to auto-kill the associated tmux window
 - **Message history** — Browse conversation history with pagination (newest first)
-- **Hook-based session tracking** — Auto-associates tmux windows with Claude sessions via `SessionStart` hook
+- **Session tracking** — Claude sessions are tracked via `SessionStart` hook; Codex sessions are tracked through remote thread metadata
 - **Persistent state** — Thread bindings and read offsets survive restarts
 
 ## Prerequisites
 
 - **tmux** — must be installed and available in PATH
-- **Claude Code** — the CLI tool (`claude`) must be installed
+- **At least one agent CLI** — Claude Code (`claude`) and/or Codex (`codex`) must be installed
 
 ## Installation
 
@@ -101,6 +102,8 @@ ALLOWED_USERS=your_telegram_user_id
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs) |
 
+When `CCBOT_ENABLED_AGENTS` is unset, CCBot detects installed `claude` and `codex` commands. If both are available, new topics show an agent picker before the directory browser.
+
 Message formatting is always HTML via `chatgpt-md-converter` (`chatgpt_md_converter` package).
 There is no runtime formatter switch to MarkdownV2.
 
@@ -110,7 +113,9 @@ There is no runtime formatter switch to MarkdownV2.
 > CLAUDE_COMMAND=IS_SANDBOX=1 claude --dangerously-skip-permissions
 > ```
 
-## Hook Setup (Recommended)
+## Claude Code Hook Setup (Recommended)
+
+This hook is used for Claude Code tmux sessions. Codex remote sessions are tracked by the Codex app-server thread metadata and do not require the Claude hook.
 
 Auto-install via CLI:
 
@@ -153,19 +158,19 @@ uv run ccbot
 | `/start`      | Show welcome message            |
 | `/history`    | Message history for this topic  |
 | `/screenshot` | Capture terminal screenshot     |
-| `/esc`        | Send Escape to interrupt Claude |
+| `/esc`        | Interrupt the active agent      |
 
-**Claude Code commands (forwarded via tmux):**
+**Agent slash commands (forwarded to the active session):**
 
 | Command    | Description                  |
 | ---------- | ---------------------------- |
 | `/clear`   | Clear conversation history   |
 | `/compact` | Compact conversation context |
 | `/cost`    | Show token/cost usage        |
-| `/help`    | Show Claude Code help        |
-| `/memory`  | Edit CLAUDE.md               |
+| `/help`    | Show agent help              |
+| `/memory`  | Edit CLAUDE.md (Claude Code) |
 
-Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/review`, `/doctor`, `/init`).
+Any unrecognized `/command` is also forwarded to the active session as-is (e.g. `/review`, `/doctor`, `/init`).
 
 ### Topic Workflow
 
@@ -176,12 +181,13 @@ Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/revie
 1. Create a new topic in the Telegram group
 2. Send any message in the topic
 3. A directory browser appears — select the project directory
-4. If the directory has existing Claude sessions, a session picker appears — choose one to resume or start fresh
-5. A tmux window is created, `claude` starts (with `--resume` if resuming), and your pending message is forwarded
+4. If multiple agents are enabled, choose Claude Code or Codex
+5. If the directory has existing sessions for that agent, a session picker appears — choose one to resume or start fresh
+6. A tmux window is created, the selected agent starts, and your pending message is forwarded
 
 **Sending messages:**
 
-Once a topic is bound to a session, just send text or voice messages in that topic — text gets forwarded to Claude Code via tmux keystrokes, and voice messages are automatically transcribed and forwarded as text.
+Once a topic is bound to a session, just send text or voice messages in that topic — text gets forwarded to the active agent, and voice messages are automatically transcribed and forwarded as text.
 
 **Killing a session:**
 
@@ -209,7 +215,7 @@ I'll look into the login bug...
 
 The monitor polls session JSONL files every 2 seconds and sends notifications for:
 
-- **Assistant responses** — Claude's text replies
+- **Assistant responses** — Agent text replies
 - **Thinking content** — Shown as expandable blockquotes
 - **Tool use/result** — Summarized with stats (e.g. "Read 42 lines", "Found 5 matches")
 - **Local command output** — stdout from commands like `git status`, prefixed with `❯ command_name`
@@ -220,7 +226,7 @@ Formatting note:
 - Telegram messages are rendered with parse mode `HTML` using `chatgpt-md-converter`
 - Long messages are split with HTML tag awareness to preserve code blocks and formatting
 
-## Running Claude Code in tmux
+## Running Agents in tmux
 
 ### Option 1: Create via Telegram (Recommended)
 
@@ -237,7 +243,7 @@ tmux new-window -n myproject -c ~/Code/myproject
 claude
 ```
 
-The window must be in the `ccbot` tmux session (configurable via `TMUX_SESSION_NAME`). The hook will automatically register it in `session_map.json` when Claude starts.
+The window must be in the `ccbot` tmux session (configurable via `TMUX_SESSION_NAME`). The hook will automatically register it in `session_map.json` when Claude starts. Codex remote sessions should be created from Telegram so CCBot can create the app-server thread and attach the tmux TUI to it.
 
 ## Data Storage
 
@@ -247,6 +253,8 @@ The window must be in the `ccbot` tmux session (configurable via `TMUX_SESSION_N
 | `$CCBOT_DIR/session_map.json`   | Hook-generated `{tmux_session:window_id: {session_id, cwd, window_name}}` mappings |
 | `$CCBOT_DIR/monitor_state.json` | Monitor byte offsets per session (prevents duplicate notifications)     |
 | `~/.claude/projects/`           | Claude Code session data (read-only)                                    |
+| `~/.codex/sessions/`            | Codex rollout/session data (read-only)                                  |
+| `~/.codex/session_index.jsonl`   | Codex session index used for listing resumable sessions                 |
 
 ## File Structure
 
@@ -257,10 +265,11 @@ src/ccbot/
 ├── hook.py                # Hook subcommand for session tracking (+ --install)
 ├── config.py              # Configuration from environment variables
 ├── bot.py                 # Telegram bot setup, command handlers, topic routing
+├── codex_remote.py        # Codex app-server remote transport and TUI command builder
 ├── session.py             # Session management, state persistence, message history
 ├── session_monitor.py     # JSONL file monitoring (polling + change detection)
 ├── monitor_state.py       # Monitor state persistence (byte offsets)
-├── transcript_parser.py   # Claude Code JSONL transcript parsing
+├── transcript_parser.py   # Claude Code and Codex JSONL transcript parsing
 ├── terminal_parser.py     # Terminal pane parsing (interactive UI + status line)
 ├── html_converter.py      # Markdown → Telegram HTML conversion + HTML-aware splitting
 ├── screenshot.py          # Terminal text → PNG image with ANSI color support
@@ -282,7 +291,7 @@ src/ccbot/
 
 ## Contributors
 
-Thanks to all the people who contribute! We encourage using Claude Code to collaborate on contributions.
+Thanks to all the people who contribute! We encourage using Claude Code or Codex to collaborate on contributions.
 
 <a href="https://github.com/six-ddc/ccmux/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=six-ddc/ccmux" />

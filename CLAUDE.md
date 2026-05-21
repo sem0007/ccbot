@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-ccmux — Telegram bot that bridges Telegram Forum topics to Claude Code sessions via tmux windows. Each topic is bound to one tmux window running one Claude Code instance.
+ccmux — Telegram bot that bridges Telegram Forum topics to Claude Code or Codex sessions via tmux windows. Each topic is bound to one tmux window running one agent session.
 
 Tech stack: Python, python-telegram-bot, tmux, uv.
 
@@ -20,7 +20,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - **Topic-only** — no backward-compat for non-topic mode. No `active_sessions`, no `/list`, no General topic routing.
 - **No message truncation** at parse layer — splitting only at send layer (`split_message`, 4096 char limit).
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.
-- **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
+- **Agent-aware session tracking** — Claude Code `SessionStart` hook writes `session_map.json`; Codex remote sessions store thread IDs in window state and stream through app-server notifications.
 - **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
 - **Rate limiting** — `AIORateLimiter(max_retries=5)` on the Application (30/s global). On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
 
@@ -33,6 +33,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 
 - Config directory: `~/.ccbot/` by default, override with `CCBOT_DIR` env var.
 - `.env` loading priority: local `.env` > config dir `.env`.
+- Agents: `CCBOT_ENABLED_AGENTS=claude,codex` or unset for command auto-detection; `CCBOT_DEFAULT_AGENT` selects the single-agent default.
 - State files: `state.json` (thread bindings), `session_map.json` (hook-generated), `monitor_state.json` (byte offsets).
 
 ## Hook Configuration

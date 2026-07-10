@@ -725,6 +725,7 @@ class SessionManager:
                 )
                 state.session_id = new_sid
                 state.cwd = new_cwd
+                state.pending_bind = False  # hook has published; no longer pending
                 changed = True
             # Update display name
             if new_wname:

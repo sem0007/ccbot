@@ -230,6 +230,11 @@ class ControlService:
         ws = self.sm.get_window_state(wid)
         ws.cwd = cwd
         ws.window_name = wname
+        # Intended monitor start offset for this window's (eventual) session
+        # file. Set for NEW sessions up-front so the monitor honors offset 0
+        # even if the hook is slow and we learn the session_id only later.
+        if not resume_session_id:
+            ws.start_offset = 0
         real_id = ws.session_id  # synced from session_map by wait_for_...
 
         # Recover the real session_id when the hook was slow, or when Claude
@@ -260,6 +265,7 @@ class ControlService:
                         offset = 0
                 else:
                     offset = 0  # new session — deliver the intro
+                ws.start_offset = offset
                 self._prewatch(real_id, str(fp), offset)
             ws.pending_bind = False
         else:

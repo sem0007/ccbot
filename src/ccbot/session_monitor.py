@@ -300,18 +300,33 @@ class SessionMonitor:
                 tracked = self.state.get_session(session_info.session_id)
 
                 if tracked is None:
-                    # For new sessions, initialize offset to end of file
-                    # to avoid re-processing old messages
+                    # First sight of a session. Default to EOF (skip history)
+                    # for foreign sessions, but honor the intended start offset
+                    # for windows WE created: a new session wants offset 0 so its
+                    # intro reply is delivered; a resumed one wants the size at
+                    # create time so old history isn't replayed. Without this,
+                    # a slow hook means we learn the session_id only after Claude
+                    # has already replied, and EOF would drop that first reply.
                     try:
                         file_size = session_info.file_path.stat().st_size
                         current_mtime = session_info.file_path.stat().st_mtime
                     except OSError:
                         file_size = 0
                         current_mtime = 0.0
+                    start_offset = file_size
+                    from .session import session_manager
+
+                    for _wid, _ws in session_manager.window_states.items():
+                        if (
+                            _ws.session_id == session_info.session_id
+                            and _ws.start_offset is not None
+                        ):
+                            start_offset = _ws.start_offset
+                            break
                     tracked = TrackedSession(
                         session_id=session_info.session_id,
                         file_path=str(session_info.file_path),
-                        last_byte_offset=file_size,
+                        last_byte_offset=start_offset,
                     )
                     self.state.update_session(tracked)
                     self._file_mtimes[session_info.session_id] = current_mtime

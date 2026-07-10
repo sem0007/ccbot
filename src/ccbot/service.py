@@ -532,18 +532,48 @@ class ControlService:
 
     # --- control topic -----------------------------------------------------
 
+    async def _control_topic_alive(self, chat_id: int, thread_id: int) -> bool:
+        """Probe whether a control topic still exists (user may have deleted it).
+
+        edit_forum_topic to the same name is side-effect-free: it succeeds (or
+        returns 'not modified') while the topic lives, and errors 'thread not
+        found' once it's gone. Any other error → assume alive (don't recreate
+        on a transient failure).
+        """
+        try:
+            await self.bot.edit_forum_topic(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                name=config.control_topic_name,
+            )
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "not found" in msg or "topic_deleted" in msg:
+                return False
+            return True
+
     async def ensure_control_topic(self) -> dict[str, int] | None:
         """Create (or re-use) the persistent, never-bound control topic.
 
-        Requires config.control_chat_id (the bot must be admin of that
-        supergroup with topic-management rights). Returns the topic dict.
+        Requires config.control_chat_id. Works in the bot's private chat too
+        (Bot API 9.3): set it to the user's own id. Verifies a persisted topic
+        still exists before reusing — if the user deleted it, a fresh one is
+        created (self-heal), so we never post into a dead thread or leave the
+        user without a control topic.
         """
         if config.control_chat_id is None or self.bot is None:
             return None
         existing = self.sm.control_topic
         if existing and existing.get("chat_id") == config.control_chat_id:
-            # Trust the persisted topic; a liveness probe would need extra perms.
-            return existing
+            if await self._control_topic_alive(
+                existing["chat_id"], existing["thread_id"]
+            ):
+                return existing
+            logger.info(
+                "Persisted control topic %s is gone — recreating", existing
+            )
+            self.sm.control_topic = None
         try:
             topic = await self.bot.create_forum_topic(
                 chat_id=config.control_chat_id,

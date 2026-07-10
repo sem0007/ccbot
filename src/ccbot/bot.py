@@ -36,7 +36,9 @@ import asyncio
 import io
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from telegram import (
     Bot,
@@ -145,6 +147,10 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Supervised background tasks (API server, periodic reconcile)
+_api_task: asyncio.Task | None = None
+_reconcile_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -1034,117 +1040,58 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
-    success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, resume_session_id=resume_session_id
+    from .service import service
+
+    if service is None:
+        await safe_edit(query, "❌ Service not initialized")
+        await query.answer("Failed")
+        return
+
+    # Delegate to the single implementation (ControlService.create_session):
+    # window create + real session_id pickup (resume fork / slow hook) + bind
+    # + group chat_id seed + monitor pre-watch + pending text. thread_id/user/
+    # chat are passed EXPLICITLY (not read from clobberable user_data inside).
+    chat_id = query.message.chat.id if query.message else None
+    pending_text = (
+        context.user_data.get("_pending_thread_text") if context.user_data else None
     )
-    if success:
+
+    result = await service.create_session(
+        selected_path,
+        resume_session_id=resume_session_id,
+        bind_thread_id=pending_thread_id,
+        user_id=user.id,
+        chat_id=chat_id,
+        pending_text=pending_text,
+    )
+
+    # Creation done — clear pending state regardless of outcome.
+    if context.user_data is not None:
+        context.user_data.pop("_pending_thread_text", None)
+        context.user_data.pop("_pending_thread_id", None)
+
+    if result.success:
         logger.info(
-            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
-            created_wname,
-            created_wid,
+            "Window created via service: %s (id=%s) sid=%s at %s "
+            "(user=%d, thread=%s, resume=%s)",
+            result.window_name,
+            result.window_id,
+            result.session_id,
             selected_path,
             user.id,
             pending_thread_id,
             resume_session_id,
         )
-        # Wait for Claude Code's SessionStart hook to register in session_map.
-        # Resume sessions take longer to start (loading session state), so use
-        # a longer timeout to avoid silently dropping messages.
-        hook_timeout = 15.0 if resume_session_id else 5.0
-        hook_ok = await session_manager.wait_for_session_map_entry(
-            created_wid, timeout=hook_timeout
-        )
-
-        # --resume: messages keep writing to the resumed session's JSONL, and
-        # current Claude Code reports the original session_id in the
-        # SessionStart hook (source="resume"), so normally nothing to fix up.
-        # If the hook timed out or reported a different id (older CC versions),
-        # force both window_state AND session_map to the resumed id —
-        # session_map drives the monitor's watch list, and load_session_map()
-        # would revert a window_state-only override on the next poll cycle.
-        if resume_session_id:
-            ws = session_manager.get_window_state(created_wid)
-            if not hook_ok:
-                logger.warning(
-                    "Hook timed out for resume window %s, "
-                    "manually setting session_id=%s cwd=%s",
-                    created_wid,
-                    resume_session_id,
-                    selected_path,
-                )
-                ws.session_id = resume_session_id
-                ws.cwd = str(selected_path)
-                ws.window_name = created_wname
-                session_manager._save_state()
-            elif ws.session_id != resume_session_id:
-                logger.info(
-                    "Resume override: window %s session_id %s -> %s",
-                    created_wid,
-                    ws.session_id,
-                    resume_session_id,
-                )
-                ws.session_id = resume_session_id
-                session_manager._save_state()
-            await session_manager.override_session_map_entry(
-                created_wid,
-                resume_session_id,
-                cwd=str(selected_path),
-                window_name=created_wname,
-            )
-
         if pending_thread_id is not None:
-            # Thread bind flow: bind thread to newly created window
-            session_manager.bind_thread(
-                user.id, pending_thread_id, created_wid, window_name=created_wname
-            )
-
             status = "Resumed" if resume_session_id else "Created"
             await safe_edit(
-                query,
-                f"✅ {message}\n\n{status}. Send messages here.",
+                query, f"✅ {result.message}\n\n{status}. Send messages here."
             )
-
-            # Send pending text if any
-            pending_text = (
-                context.user_data.get("_pending_thread_text")
-                if context.user_data
-                else None
-            )
-            if pending_text:
-                logger.debug(
-                    "Forwarding pending text to window %s (len=%d)",
-                    created_wname,
-                    len(pending_text),
-                )
-                if context.user_data is not None:
-                    context.user_data.pop("_pending_thread_text", None)
-                    context.user_data.pop("_pending_thread_id", None)
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid,
-                    pending_text,
-                )
-                if not send_ok:
-                    logger.warning("Failed to forward pending text: %s", send_msg)
-                    resolved_chat = session_manager.resolve_chat_id(
-                        user.id, pending_thread_id
-                    )
-                    await safe_send(
-                        context.bot,
-                        resolved_chat,
-                        f"❌ Failed to send pending message: {send_msg}",
-                        message_thread_id=pending_thread_id,
-                    )
-            elif context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
         else:
-            # Should not happen in topic-only mode, but handle gracefully
-            await safe_edit(query, f"✅ {message}")
+            await safe_edit(query, f"✅ {result.message}")
     else:
-        await safe_edit(query, f"❌ {message}")
-        if pending_thread_id is not None and context.user_data is not None:
-            context.user_data.pop("_pending_thread_id", None)
-            context.user_data.pop("_pending_thread_text", None)
-    await query.answer("Created" if success else "Failed")
+        await safe_edit(query, f"❌ {result.message}")
+    await query.answer("Created" if result.success else "Failed")
 
 
 # --- Callback query handler ---
@@ -1336,6 +1283,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         clear_browse_state(context.user_data)
+
+        # Fall back to the live thread when user_data lost the pending id
+        # (context.user_data can be clobbered between browse and confirm) — a
+        # None thread_id here was a root cause of "new session doesn't bind".
+        if pending_thread_id is None:
+            pending_thread_id = confirm_thread_id
 
         # Check for existing sessions in this directory
         sessions = await session_manager.list_sessions_for_directory(selected_path)
@@ -1828,8 +1781,107 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 # --- App lifecycle ---
 
 
+async def _notify_control(bot: Bot, text: str) -> None:
+    """Post a message to the persistent control topic, if one exists."""
+    ct = session_manager.control_topic
+    if not ct:
+        return
+    try:
+        await bot.send_message(
+            chat_id=ct["chat_id"], message_thread_id=ct["thread_id"], text=text
+        )
+    except Exception as e:
+        logger.error("control-topic notify failed: %s", e)
+
+
+async def supervise(
+    coro_factory: Callable[[], Awaitable[None]],
+    name: str,
+    bot: Bot | None = None,
+    max_restarts: int = 5,
+    base_backoff: float = 2.0,
+) -> None:
+    """Run a background coroutine, restarting on crash with capped backoff.
+
+    Gives up after max_restarts failures so a persistent desync can't hammer
+    tmux/disk forever; notifies the control topic when it does.
+    """
+    restarts = 0
+    while True:
+        try:
+            await coro_factory()
+            return  # clean completion (e.g. run_api after cancel)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            restarts += 1
+            logger.error(
+                "Background task '%s' crashed (%d/%d): %s",
+                name,
+                restarts,
+                max_restarts,
+                e,
+            )
+            if restarts >= max_restarts:
+                logger.error("Background task '%s' giving up", name)
+                if bot is not None:
+                    await _notify_control(
+                        bot, f"⚠️ Task '{name}' stopped after {restarts} crashes: {e}"
+                    )
+                return
+            await asyncio.sleep(base_backoff * restarts)
+
+
+async def _reconcile_loop(svc: Any) -> None:
+    """Periodically re-align tmux ↔ state ↔ monitor (never raises upward)."""
+    while True:
+        await asyncio.sleep(config.reconcile_interval)
+        try:
+            await svc.reconcile()
+        except Exception as e:
+            logger.error("reconcile loop error: %s", e)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Central error handler: log and surface fatals to the control topic."""
+    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+    try:
+        await _notify_control(context.bot, f"⚠️ Error: {context.error}")
+    except Exception:
+        pass
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/kill — kill this topic's window and delete the forum topic.
+
+    Previously advertised as a BotCommand but never registered, so '/kill'
+    leaked into Claude as literal text.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        if update.message:
+            await update.message.reply_text("Not in a topic")
+        return
+    from .service import service
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if service and wid:
+        await service.kill_session(wid)
+    chat = update.effective_chat
+    try:
+        if chat:
+            await context.bot.delete_forum_topic(
+                chat_id=chat.id, message_thread_id=thread_id
+            )
+    except Exception as e:
+        logger.error("delete_forum_topic failed: %s", e)
+
+
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _api_task, _reconcile_task
 
     await application.bot.delete_my_commands()
 
@@ -1864,10 +1916,20 @@ async def post_init(application: Application) -> None:
 
     monitor = SessionMonitor()
 
-    async def message_callback(msg: NewMessage) -> None:
+    # Wire the delivery bus: the monitor pushes each reply into ControlService,
+    # which fans it out to (1) Telegram delivery and (2) the API ring buffer —
+    # so the human and an automated agent see the same stream of Claude replies.
+    from .service import ControlService, set_service
+
+    svc = ControlService(monitor, application.bot)
+    set_service(svc)
+    application.bot_data["service"] = svc
+
+    async def _telegram_delivery(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)
 
-    monitor.set_message_callback(message_callback)
+    svc.bus.subscribe(_telegram_delivery)
+    monitor.set_message_callback(svc.on_new_message)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
@@ -1876,9 +1938,40 @@ async def post_init(application: Application) -> None:
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
 
+    # Local debug/control API (fail-closed inside run_api: no token → returns).
+    from .api import run_api
+
+    _api_task = asyncio.create_task(
+        supervise(lambda: run_api(svc), "api", application.bot)
+    )
+
+    # Periodic reconcile keeps tmux ↔ state ↔ monitor aligned at runtime.
+    _reconcile_task = asyncio.create_task(
+        supervise(lambda: _reconcile_loop(svc), "reconcile", application.bot)
+    )
+    logger.info("API + reconcile tasks started")
+
+    # Persistent control topic (no-op unless CCBOT_CONTROL_CHAT_ID is set).
+    try:
+        await svc.ensure_control_topic()
+    except Exception as e:
+        logger.error("ensure_control_topic failed: %s", e)
+
 
 async def post_shutdown(application: Application) -> None:
-    global _status_poll_task
+    global _status_poll_task, _api_task, _reconcile_task
+
+    # Stop the API + reconcile tasks before workers so no request races shutdown.
+    for task_name in ("_api_task", "_reconcile_task"):
+        task = globals().get(task_name)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            globals()[task_name] = None
+    logger.info("API + reconcile tasks stopped")
 
     # Stop status polling
     if _status_poll_task:
@@ -1914,9 +2007,11 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_error_handler(error_handler)
     # Topic closed event — auto-kill associated window
     application.add_handler(
         MessageHandler(

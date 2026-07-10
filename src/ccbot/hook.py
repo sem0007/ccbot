@@ -24,8 +24,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Validate session_id looks like a UUID
-_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# Validate session_id looks like a UUID.
+# Case-insensitive to match tmux_manager._UUID_RE — otherwise an uppercase
+# resume-id passes into `claude --resume` but the hook rejects it, leaving the
+# window with no session_map entry (delivery then never finds the session).
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 

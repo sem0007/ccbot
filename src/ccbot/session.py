@@ -26,6 +26,7 @@ import fcntl
 import json
 import logging
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Callable, Iterator
@@ -36,7 +37,7 @@ import aiofiles
 from .config import config
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import atomic_write_json
+from .utils import atomic_write_json, read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +50,23 @@ class WindowState:
         session_id: Associated Claude session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        requested_resume_id: session_id we asked `claude --resume` to open.
+            Claude may fork a NEW session_id on resume; we reconcile the real
+            one against this to override session_map.
+        pending_bind: True between window creation and the hook publishing the
+            session_id. Protects a fresh, still-empty window_state from the
+            stale-window cleanup in load_session_map.
+        start_offset: byte offset the monitor should start reading this
+            session's JSONL from (0 for a new session so its intro reply is
+            delivered; file-size-at-create for resume so history isn't replayed).
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    requested_resume_id: str | None = None
+    pending_bind: bool = False
+    start_offset: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -62,6 +75,12 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.requested_resume_id:
+            d["requested_resume_id"] = self.requested_resume_id
+        if self.pending_bind:
+            d["pending_bind"] = True
+        if self.start_offset is not None:
+            d["start_offset"] = self.start_offset
         return d
 
     @classmethod
@@ -70,6 +89,9 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            requested_resume_id=data.get("requested_resume_id"),
+            pending_bind=data.get("pending_bind", False),
+            start_offset=data.get("start_offset"),
         )
 
 
@@ -111,11 +133,53 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # Persistent control topic: {"chat_id": -100…, "thread_id": N} or None.
+    # Never bound to a tmux window; the dashboard/command hub lives here.
+    control_topic: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         self._load_state()
+        # Serializes in-memory-mutation → _save_state so an await between a
+        # mutation and its persist can't interleave with another coroutine's
+        # write (the monitor loop and Telegram handlers share one event loop;
+        # there is no cross-process race on state.json, so no fcntl.flock here).
+        self._state_lock = asyncio.Lock()
+        # Depth counter for _transaction(): when > 0, _save_state defers the
+        # actual disk write until the outermost transaction exits, so a batch
+        # of related mutations (bind_thread + set session_id + set_group_chat_id)
+        # lands as a single atomic file write.
+        self._txn_depth = 0
+        self._txn_pending_save = False
+
+    @asynccontextmanager
+    async def _transaction(self):
+        """Batch related state mutations into one persisted write.
+
+        Usage:
+            async with session_manager._transaction():
+                session_manager.bind_thread(...)
+                session_manager.get_window_state(wid).session_id = sid
+                session_manager.set_group_chat_id(...)
+        All the individual _save_state calls collapse into one write on exit.
+        """
+        async with self._state_lock:
+            self._txn_depth += 1
+            try:
+                yield
+            finally:
+                self._txn_depth -= 1
+                if self._txn_depth == 0 and self._txn_pending_save:
+                    self._txn_pending_save = False
+                    self._write_state()
 
     def _save_state(self) -> None:
+        # Inside a _transaction(), defer the actual write to the batch commit.
+        if self._txn_depth > 0:
+            self._txn_pending_save = True
+            return
+        self._write_state()
+
+    def _write_state(self) -> None:
         state: dict[str, Any] = {
             "window_states": {k: v.to_dict() for k, v in self.window_states.items()},
             "user_window_offsets": {
@@ -127,6 +191,7 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "control_topic": self.control_topic,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -160,6 +225,7 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.control_topic = state.get("control_topic")
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -190,6 +256,7 @@ class SessionManager:
                 self.thread_bindings = {}
                 self.window_display_names = {}
                 self.group_chat_ids = {}
+                self.control_topic = None
                 pass
 
     async def resolve_stale_ids(self) -> None:
@@ -615,18 +682,22 @@ class SessionManager:
 
         # Self-heal old-format keys (session:window_name) that an outdated hook
         # may write at runtime: resolve them against live windows and rewrite to
-        # @window_id in place, so the delivery loop below can see them. Only
-        # lists tmux windows when such keys are actually present (zero cost in
-        # steady state). Mirrors the tolerance already in _load_current_session_map.
+        # @window_id form so the delivery loop below can see them. Write through
+        # the locked mutator (shares the hook's flock) — a bare atomic_write_json
+        # here could clobber a concurrent hook write (lost update). Only lists
+        # tmux windows when such keys are actually present (zero cost otherwise).
         if any(
             k.startswith(prefix) and not self._is_window_id(k[len(prefix) :])
             for k in session_map
         ):
             windows = await tmux_manager.list_windows()
             live_by_name = {w.window_name: w.window_id for w in windows}
-            if self._migrate_old_format_map(session_map, live_by_name):
-                atomic_write_json(config.session_map_file, session_map)
-                logger.info("Migrated old-format session_map keys during load")
+            await self._migrate_old_format_session_map_keys(live_by_name)
+            try:
+                async with aiofiles.open(config.session_map_file, "r") as f:
+                    session_map = json.loads(await f.read())
+            except (json.JSONDecodeError, OSError):
+                pass
 
         valid_wids: set[str] = set()
         changed = False
@@ -662,12 +733,21 @@ class SessionManager:
                     self.window_display_names[window_id] = new_wname
                     changed = True
 
-        # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
-        for wid in stale_wids:
-            logger.info("Removing stale window_state: %s", wid)
-            del self.window_states[wid]
-            changed = True
+        # Clean up window_states entries not in current session_map — but keep
+        # windows that still exist in tmux or are awaiting their first hook
+        # publish (pending_bind). Deleting a fresh, still-empty window here is
+        # exactly what used to drop a brand-new session's binding before the
+        # hook wrote its session_id. Only lists tmux when there are candidates.
+        stale_candidates = [w for w in self.window_states if w and w not in valid_wids]
+        if stale_candidates:
+            live_ids = {win.window_id for win in await tmux_manager.list_windows()}
+            for wid in stale_candidates:
+                st = self.window_states.get(wid)
+                if wid in live_ids or (st and st.pending_bind):
+                    continue
+                logger.info("Removing stale window_state: %s", wid)
+                del self.window_states[wid]
+                changed = True
 
         if changed:
             self._save_state()
@@ -767,29 +847,64 @@ class SessionManager:
         extracts summary info from each.
 
         Returns a list sorted by mtime (most recent first), capped at 10.
-        """
-        encoded_cwd = self._encode_cwd(cwd)
-        project_dir = config.claude_projects_path / encoded_cwd
-        if not project_dir.is_dir():
-            return []
 
-        # Collect JSONL files sorted by mtime (newest first)
-        jsonl_files = sorted(
-            project_dir.glob("*.jsonl"),
+        Discovery is robust to _encode_cwd mismatches (e.g. sessions teleported
+        from another host keep a foreign `cwd` inside the JSONL, and worktree
+        sessions live in `…--claude-worktrees-…` dirs): the encoded dir is tried
+        first, then every project dir is scanned and each file's real `cwd`
+        (read from the JSONL) is compared against the target — so a session is
+        found by its actual cwd, not by trusting the folder name.
+        """
+        try:
+            target = str(Path(cwd).resolve())
+        except (OSError, ValueError):
+            target = cwd
+
+        candidate_files: dict[str, Path] = {}  # session_id -> newest file
+
+        def _consider(f: Path) -> None:
+            if f.stem == "sessions-index":
+                return
+            prev = candidate_files.get(f.stem)
+            if prev is None or f.stat().st_mtime > prev.stat().st_mtime:
+                candidate_files[f.stem] = f
+
+        # Fast path: the directly-encoded project dir.
+        project_dir = config.claude_projects_path / self._encode_cwd(cwd)
+        if project_dir.is_dir():
+            for f in project_dir.glob("*.jsonl"):
+                _consider(f)
+
+        # Fallback: scan every project dir, keep files whose real cwd matches.
+        # Only pays the cost when the fast path is thin (mismatch/teleport).
+        if len(candidate_files) == 0 and config.claude_projects_path.is_dir():
+            for f in config.claude_projects_path.glob("*/*.jsonl"):
+                if f.stem == "sessions-index":
+                    continue
+                real = await asyncio.to_thread(read_cwd_from_jsonl, f)
+                if not real:
+                    continue
+                try:
+                    real_norm = str(Path(real).resolve())
+                except (OSError, ValueError):
+                    real_norm = real
+                if real_norm == target:
+                    _consider(f)
+
+        ordered = sorted(
+            candidate_files.values(),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
 
-        # Skip sessions-index and cap at 10
         sessions: list[ClaudeSession] = []
-        for f in jsonl_files:
-            if f.stem == "sessions-index":
-                continue
+        for f in ordered:
             if len(sessions) >= 10:
                 break
-            session_id = f.stem
-            session = await self._get_session_direct(session_id, cwd)
-            if session and session.message_count > 0:
+            session = await self._get_session_direct(f.stem, cwd)
+            # Keep even 0-message sessions: a freshly-forked resume target may
+            # not have grown yet, and dropping it hides a valid session.
+            if session:
                 sessions.append(session)
         return sessions
 
@@ -916,14 +1031,53 @@ class SessionManager:
 
         Returns list of (user_id, window_id, thread_id) tuples.
         """
-        result: list[tuple[int, str, int]] = []
+
+        def _scan() -> list[tuple[int, str, int]]:
+            hits: list[tuple[int, str, int]] = []
+            for user_id, thread_id, window_id in self.iter_thread_bindings():
+                # In-memory lookup: window_states carries the authoritative
+                # window→session mapping (synced from session_map each cycle).
+                state = self.window_states.get(window_id)
+                if state and state.session_id == session_id:
+                    hits.append((user_id, window_id, thread_id))
+            return hits
+
+        # Fast hot path — no disk I/O when state is already consistent.
+        result = _scan()
+        if result:
+            return result
+
+        # Slow self-healing path (only on a miss): the session_map may have a
+        # fresh window→session_id the in-memory state hasn't absorbed yet, or a
+        # window is bound but its session_id is still empty/wrong. Reload the
+        # map and, if still empty, read each bound window's real session_id from
+        # its JSONL and adopt it — so a reply is delivered instead of silently
+        # dropped as "No active users".
+        await self.load_session_map()
+        result = _scan()
+        if result:
+            return result
+
         for user_id, thread_id, window_id in self.iter_thread_bindings():
-            # In-memory lookup only: window_states carries the authoritative
-            # window→session mapping (synced from session_map each poll cycle).
-            # Reading the JSONL here (resolve_session_for_window) would be
-            # O(bindings × file size) on every incoming message.
             state = self.window_states.get(window_id)
-            if state and state.session_id == session_id:
+            if not state or not state.cwd:
+                continue
+            if state.session_id == session_id:
+                result.append((user_id, window_id, thread_id))
+                continue
+            real = await self._get_session_direct(session_id, state.cwd)
+            if real and Path(real.file_path).exists():
+                # This window's cwd hosts the session that produced the message.
+                logger.info(
+                    "find_users_for_session self-heal: adopting session_id=%s "
+                    "onto window %s (was %s)",
+                    session_id,
+                    window_id,
+                    state.session_id or "<empty>",
+                )
+                state.session_id = session_id
+                await self.override_session_map_entry(window_id, session_id, state.cwd)
+                self._save_state()
                 result.append((user_id, window_id, thread_id))
         return result
 

@@ -19,7 +19,12 @@ from .utils import ccbot_dir
 logger = logging.getLogger(__name__)
 
 # Env vars that must not leak to child processes (e.g. Claude Code via tmux)
-SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
+SENSITIVE_ENV_VARS = {
+    "TELEGRAM_BOT_TOKEN",
+    "ALLOWED_USERS",
+    "OPENAI_API_KEY",
+    "CCBOT_API_TOKEN",
+}
 
 
 class Config:
@@ -106,6 +111,32 @@ class Config:
         self.openai_base_url: str = os.getenv(
             "OPENAI_BASE_URL", "https://api.openai.com/v1"
         )
+
+        # --- Local debug/control HTTP API ---------------------------------
+        # The API is the automation surface: since ALLOWED_USERS restricts
+        # Telegram to a human, an agent drives the bot through this API.
+        # Bind loopback only. Fail-closed: without a token the server refuses
+        # to start (see api.run_api), so an empty token never means "no auth".
+        self.api_host = os.getenv("CCBOT_API_HOST", "127.0.0.1")
+        self.api_port = int(os.getenv("CCBOT_API_PORT", "8787"))
+        self.api_token: str = os.getenv("CCBOT_API_TOKEN", "")
+        # Colon-separated allowlist of directory roots where POST /sessions may
+        # spawn Claude. Empty = unrestricted (only sane on a trusted machine).
+        self.api_allowed_cwds: list[str] = [
+            p for p in os.getenv("CCBOT_API_ALLOWED_CWDS", "").split(":") if p
+        ]
+
+        # --- Persistent Telegram control topic ----------------------------
+        # Supergroup (negative -100… id) where the never-terminating control
+        # topic is created. Without it the control-topic feature stays off.
+        _control_chat = os.getenv("CCBOT_CONTROL_CHAT_ID", "").strip()
+        self.control_chat_id: int | None = int(_control_chat) if _control_chat else None
+        self.control_topic_name = os.getenv("CCBOT_CONTROL_TOPIC_NAME", "🎛 Control")
+
+        # --- Fault tolerance ----------------------------------------------
+        # Period (seconds) of the background reconcile loop that re-aligns
+        # tmux ↔ session_map ↔ state ↔ monitor_state.
+        self.reconcile_interval = float(os.getenv("CCBOT_RECONCILE_INTERVAL", "30"))
 
         # Scrub sensitive vars from os.environ so child processes never inherit them.
         # Values are already captured in Config attributes above.

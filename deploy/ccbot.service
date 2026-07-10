@@ -1,0 +1,24 @@
+[Unit]
+Description=ccbot — Telegram<->tmux bridge for Claude Code
+# tmux server is an independent daemon; workers survive bot restarts.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Editable uv-tool install puts the launcher here.
+ExecStart=%h/.local/bin/ccbot
+WorkingDirectory=%h/ConnectedSpace/Projects/ccbot
+# Restart on crash, but cap the storm: if it fails 5 times in 60s, give up
+# (a persistent state desync must not hammer tmux/disk forever).
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StandardOutput=append:%h/.ccbot/run.log
+StandardError=append:%h/.ccbot/run.log
+# The API token / bot token come from ~/.ccbot/.env, read by config.py itself.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

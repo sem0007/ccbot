@@ -2004,8 +2004,22 @@ async def post_init(application: Application) -> None:
     logger.info("API + reconcile tasks started")
 
     # Persistent control topic (no-op unless CCBOT_CONTROL_CHAT_ID is set).
+    # Works in the bot's private chat too (Bot API 9.3 topics-in-DM): set
+    # CCBOT_CONTROL_CHAT_ID to the user's own id — no supergroup required.
     try:
-        await svc.ensure_control_topic()
+        info = await svc.ensure_control_topic()
+        if info:
+            from .handlers.control_topic import render_dashboard
+
+            dash_text, keyboard = await render_dashboard(svc)
+            await application.bot.send_message(
+                chat_id=info["chat_id"],
+                message_thread_id=info["thread_id"],
+                text=dash_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            logger.info("Control topic ready: %s", info)
     except Exception as e:
         logger.error("ensure_control_topic failed: %s", e)
 

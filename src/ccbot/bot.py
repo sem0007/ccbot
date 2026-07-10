@@ -56,6 +56,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -1932,6 +1933,25 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error("delete_forum_topic failed: %s", e)
 
 
+async def _debug_log_update(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TEMP diagnostics: log the shape of every incoming update (group -1)."""
+    try:
+        u = update  # type: ignore[assignment]
+        msg = getattr(u, "message", None) or getattr(u, "edited_message", None)
+        parts = [f"update_id={getattr(u, 'update_id', '?')}"]
+        if msg is not None:
+            parts.append(f"thread_id={getattr(msg, 'message_thread_id', None)}")
+            parts.append(f"is_topic={getattr(msg, 'is_topic_message', None)}")
+            parts.append(f"text={getattr(msg, 'text', None)!r}")
+            parts.append(f"ftc={getattr(msg, 'forum_topic_created', None)}")
+            parts.append(f"fte={getattr(msg, 'forum_topic_edited', None)}")
+        else:
+            parts.append(f"non-message: {type(u).__name__}")
+        logger.info("DBG_UPDATE %s", " ".join(parts))
+    except Exception as e:
+        logger.warning("DBG_UPDATE failed: %s", e)
+
+
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _api_task, _reconcile_task
 
@@ -2068,6 +2088,9 @@ def create_bot() -> Application:
         .post_shutdown(post_shutdown)
         .build()
     )
+
+    # TEMP: log every incoming update in a separate group so it never consumes.
+    application.add_handler(TypeHandler(Update, _debug_log_update), group=-1)
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))

@@ -49,3 +49,8 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Control topic dashboard (persistent, never-bound topic)
+CB_CTRL_REFRESH = "ct:refresh"  # redraw the dashboard
+CB_CTRL_RECONCILE = "ct:reconcile"  # force a reconcile then redraw
+CB_CTRL_KILL = "ct:kill:"  # ct:kill:<window_id> — kill a worker window

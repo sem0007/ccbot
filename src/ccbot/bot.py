@@ -70,6 +70,9 @@ from .handlers.callback_data import (
     CB_ASK_SPACE,
     CB_ASK_TAB,
     CB_ASK_UP,
+    CB_CTRL_KILL,
+    CB_CTRL_RECONCILE,
+    CB_CTRL_REFRESH,
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,
     CB_DIR_PAGE,
@@ -835,6 +838,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = update.message.text
 
+    # Control topic guard: this topic is never bound to a worker window — any
+    # message here just (re)draws the dashboard. Must run BEFORE the picker
+    # logic, or get_window_for_thread==None would wrongly open a directory browser.
+    ct = session_manager.control_topic
+    if ct and thread_id == ct.get("thread_id"):
+        from .service import service
+
+        if service is not None:
+            from .handlers.control_topic import render_dashboard
+
+            dash_text, keyboard = await render_dashboard(service)
+            resolved = session_manager.resolve_chat_id(user.id, thread_id)
+            await context.bot.send_message(
+                chat_id=resolved,
+                message_thread_id=thread_id,
+                text=dash_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        return
+
     # Ignore text in window picker mode (only for the same thread)
     if context.user_data and context.user_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
         pending_tid = context.user_data.get("_pending_thread_id")
@@ -1116,6 +1140,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
+
+    # Control-topic buttons: refresh / reconcile / kill a worker.
+    if data == CB_CTRL_REFRESH or data == CB_CTRL_RECONCILE or data.startswith(
+        CB_CTRL_KILL
+    ):
+        from .service import service
+        from .handlers.control_topic import render_dashboard
+
+        if service is None:
+            await query.answer("Service not ready")
+            return
+        if data == CB_CTRL_RECONCILE:
+            await service.reconcile()
+            await query.answer("Сверка выполнена")
+        elif data.startswith(CB_CTRL_KILL):
+            wid = data[len(CB_CTRL_KILL) :]
+            await service.kill_session(wid)
+            await query.answer(f"Убито {wid}")
+        else:
+            await query.answer()
+        dash_text, keyboard = await render_dashboard(service)
+        try:
+            await query.edit_message_text(
+                dash_text, parse_mode="HTML", reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.debug("dashboard edit skipped: %s", e)
+        return
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>

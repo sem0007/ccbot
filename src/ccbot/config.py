@@ -106,6 +106,15 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Directory the browser opens at when creating a new session. Defaults
+        # to ~/ConnectedSpace if it exists, else the current working directory.
+        _browse_root = os.getenv("CCBOT_BROWSE_ROOT", "").strip()
+        if _browse_root:
+            self.browse_root = _browse_root
+        else:
+            _cs = Path.home() / "ConnectedSpace"
+            self.browse_root = str(_cs if _cs.is_dir() else Path.cwd())
+
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(

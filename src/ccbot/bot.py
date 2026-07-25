@@ -49,6 +49,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import NetworkError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -310,6 +311,68 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Send Escape control character (no enter)
     await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+async def fixcontrol_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Wipe every tracked message in the control topic and repost a fresh dashboard.
+
+    Telegram exposes no way to enumerate a topic's messages, so we can only
+    delete the ones the bot has tracked (dashboards, error/notice posts, and
+    user messages that triggered a redraw). Deletion is best-effort per id —
+    already-gone or too-old (>48h) messages are skipped silently.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    ct = session_manager.control_topic
+    thread_id = _get_thread_id(update)
+    if not ct or thread_id != ct.get("thread_id"):
+        await safe_reply(
+            update.message, "❌ Эту команду можно запускать только в теме Control."
+        )
+        return
+
+    chat_id = ct["chat_id"]
+    # Tracked ids + the command message itself (just arrived, not yet tracked).
+    ids = set(session_manager.take_control_message_ids())
+    ids.add(update.message.message_id)
+
+    deleted = 0
+    for mid in sorted(ids, reverse=True):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            deleted += 1
+        except Exception as e:
+            logger.debug("fixcontrol: skip message %s: %s", mid, e)
+
+    logger.info("fixcontrol: deleted %d/%d control messages", deleted, len(ids))
+
+    # Repost a fresh dashboard (or a plain marker if the service isn't ready).
+    from .service import service
+
+    if service is not None:
+        from .handlers.control_topic import render_dashboard
+
+        dash_text, keyboard = await render_dashboard(service)
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text=dash_text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    else:
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            text="🎛 Control очищен.",
+        )
+    session_manager.track_control_message(sent.message_id)
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -851,13 +914,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             dash_text, keyboard = await render_dashboard(service)
             resolved = session_manager.resolve_chat_id(user.id, thread_id)
-            await context.bot.send_message(
+            # Track the user's message and the fresh dashboard so /fixcontrol
+            # can later wipe the topic clean.
+            session_manager.track_control_message(update.message.message_id)
+            sent = await context.bot.send_message(
                 chat_id=resolved,
                 message_thread_id=thread_id,
                 text=dash_text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
+            session_manager.track_control_message(sent.message_id)
         return
 
     # Ignore text in window picker mode (only for the same thread)
@@ -957,7 +1024,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             user.id,
             thread_id,
         )
-        start_path = str(Path.cwd())
+        start_path = config.browse_root
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
@@ -1048,6 +1115,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Window creation helper ---
 
 
+def _sanitize_topic_name(text: str | None) -> str | None:
+    """Turn a user's first message into a topic/window name.
+
+    Collapses whitespace and newlines to single spaces and caps length to
+    Telegram's 128-char forum-topic limit. Returns None for blank input so
+    callers fall back to the directory-based default name.
+    """
+    if not text:
+        return None
+    name = " ".join(text.split())
+    if not name:
+        return None
+    return name[:128]
+
+
 async def _create_and_bind_window(
     query: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1077,9 +1159,11 @@ async def _create_and_bind_window(
     # + group chat_id seed + monitor pre-watch + pending text. thread_id/user/
     # chat are passed EXPLICITLY (not read from clobberable user_data inside).
     chat_id = query.message.chat.id if query.message else None
+    # The user's first message NAMES the topic — it is never forwarded to Claude.
     pending_text = (
         context.user_data.get("_pending_thread_text") if context.user_data else None
     )
+    topic_name = _sanitize_topic_name(pending_text)
 
     result = await service.create_session(
         selected_path,
@@ -1087,7 +1171,8 @@ async def _create_and_bind_window(
         bind_thread_id=pending_thread_id,
         user_id=user.id,
         chat_id=chat_id,
-        pending_text=pending_text,
+        pending_text=None,
+        window_name=topic_name,
     )
 
     # Creation done — clear pending state regardless of outcome.
@@ -1107,6 +1192,18 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
+        # Rename the Telegram forum topic to match the window name (the user's
+        # first message). Best-effort — a failure must not abort session setup.
+        if topic_name and pending_thread_id is not None and chat_id is not None:
+            new_name = result.window_name or topic_name
+            try:
+                await context.bot.edit_forum_topic(
+                    chat_id=chat_id,
+                    message_thread_id=pending_thread_id,
+                    name=new_name,
+                )
+            except Exception as e:
+                logger.warning("Failed to rename forum topic to %r: %s", new_name, e)
         if pending_thread_id is not None:
             status = "Resumed" if resume_session_id else "Created"
             await safe_edit(
@@ -1531,7 +1628,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         # Preserve pending thread info, clear only picker state
         clear_window_picker_state(context.user_data)
-        start_path = str(Path.cwd())
+        start_path = config.browse_root
         msg_text, keyboard, subdirs = build_directory_browser(start_path)
         if context.user_data is not None:
             context.user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
@@ -1840,9 +1937,10 @@ async def _notify_control(bot: Bot, text: str) -> None:
     if not ct:
         return
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=ct["chat_id"], message_thread_id=ct["thread_id"], text=text
         )
+        session_manager.track_control_message(sent.message_id)
     except Exception as e:
         logger.error("control-topic notify failed: %s", e)
 
@@ -1896,10 +1994,20 @@ async def _reconcile_loop(svc: Any) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Central error handler: log and surface fatals to the control topic."""
-    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
+    """Central error handler: log and surface fatals to the control topic.
+
+    Transient network hiccups (dropped long-poll, 502 Bad Gateway, read
+    timeouts) arrive as ``telegram.error.NetworkError`` and self-recover on the
+    next retry, so they are logged but not surfaced to the control topic to
+    avoid noise. Everything else is reported.
+    """
+    err = context.error
+    if isinstance(err, NetworkError):
+        logger.warning("Transient network error (not surfaced): %s", err)
+        return
+    logger.error("Unhandled error: %s", err, exc_info=err)
     try:
-        await _notify_control(context.bot, f"⚠️ Error: {context.error}")
+        await _notify_control(context.bot, f"⚠️ Error: {err}")
     except Exception:
         pass
 
@@ -1965,6 +2073,7 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("fixcontrol", "Clear the control topic and repost the dashboard"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -2032,13 +2141,14 @@ async def post_init(application: Application) -> None:
             from .handlers.control_topic import render_dashboard
 
             dash_text, keyboard = await render_dashboard(svc)
-            await application.bot.send_message(
+            sent = await application.bot.send_message(
                 chat_id=info["chat_id"],
                 message_thread_id=info["thread_id"],
                 text=dash_text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
+            session_manager.track_control_message(sent.message_id)
             logger.info("Control topic ready: %s", info)
     except Exception as e:
         logger.error("ensure_control_topic failed: %s", e)
@@ -2099,6 +2209,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("fixcontrol", fixcontrol_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_error_handler(error_handler)
     # Topic closed event — auto-kill associated window

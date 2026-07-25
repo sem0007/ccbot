@@ -136,6 +136,11 @@ class SessionManager:
     # Persistent control topic: {"chat_id": -100…, "thread_id": N} or None.
     # Never bound to a tmux window; the dashboard/command hub lives here.
     control_topic: dict[str, int] | None = None
+    # Message IDs the bot has posted into (or received in) the control topic.
+    # Telegram offers no way to enumerate a topic's messages or attribute a
+    # message to a thread, so we track them ourselves to let /fixcontrol wipe
+    # the topic clean. Bounded to avoid unbounded growth.
+    control_message_ids: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -192,6 +197,7 @@ class SessionManager:
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
             "control_topic": self.control_topic,
+            "control_message_ids": self.control_message_ids,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -199,6 +205,26 @@ class SessionManager:
     def _is_window_id(self, key: str) -> bool:
         """Check if a key looks like a tmux window ID (e.g. '@0', '@12')."""
         return key.startswith("@") and len(key) > 1 and key[1:].isdigit()
+
+    def track_control_message(self, message_id: int) -> None:
+        """Remember a message posted into / received in the control topic.
+
+        Lets /fixcontrol delete it later. Bounded to the most recent 1000 ids
+        so long-lived deployments never grow this list without limit.
+        """
+        if message_id in self.control_message_ids:
+            return
+        self.control_message_ids.append(message_id)
+        if len(self.control_message_ids) > 1000:
+            self.control_message_ids = self.control_message_ids[-1000:]
+        self._save_state()
+
+    def take_control_message_ids(self) -> list[int]:
+        """Return all tracked control-topic message ids and clear the list."""
+        ids = self.control_message_ids
+        self.control_message_ids = []
+        self._save_state()
+        return ids
 
     def _load_state(self) -> None:
         """Load state synchronously during initialization.
@@ -226,6 +252,7 @@ class SessionManager:
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
                 self.control_topic = state.get("control_topic")
+                self.control_message_ids = list(state.get("control_message_ids", []))
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -257,6 +284,7 @@ class SessionManager:
                 self.window_display_names = {}
                 self.group_chat_ids = {}
                 self.control_topic = None
+                self.control_message_ids = []
                 pass
 
     async def resolve_stale_ids(self) -> None:

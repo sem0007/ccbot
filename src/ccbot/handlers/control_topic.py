@@ -43,8 +43,11 @@ async def render_dashboard(service: Any) -> tuple[str, InlineKeyboardMarkup]:
         st_icon = _STATUS_ICON.get(st, "⚪")
         sid = (s.get("session_id") or "")[:8] or "—"
         name = s.get("window_name") or s["window_id"]
+        # The bold name already IS the topic name (window_display_names is kept
+        # in sync with Telegram topic renames), so don't repeat the raw numeric
+        # thread id — only flag sessions that have no topic bound at all.
         thr = s.get("thread_id")
-        thr_txt = f" · тема {thr}" if thr else " · без темы"
+        thr_txt = "" if thr else " · без темы"
         flags = ""
         if s.get("pending_bind"):
             flags += " ⏳"

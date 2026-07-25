@@ -518,42 +518,14 @@ async def topic_closed_handler(
 async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Handle topic rename — sync new name to tmux window and internal state."""
-    user = update.effective_user
-    if not user or not is_user_allowed(user.id):
-        return
+    """Ignore Telegram topic renames — topic titles are NOT dragged into tmux.
 
-    msg = update.message
-    if not msg or not msg.forum_topic_edited:
-        return
-
-    new_name = msg.forum_topic_edited.name
-    if new_name is None:
-        # Icon-only change, no rename needed
-        return
-
-    thread_id = _get_thread_id(update)
-    if thread_id is None:
-        return
-
-    wid = session_manager.get_window_for_thread(user.id, thread_id)
-    if not wid:
-        logger.debug(
-            "Topic edited: no binding (user=%d, thread=%d)", user.id, thread_id
-        )
-        return
-
-    old_name = session_manager.get_display_name(wid)
-    await tmux_manager.rename_window(wid, new_name)
-    session_manager.update_display_name(wid, new_name)
-    logger.info(
-        "Topic renamed: '%s' -> '%s' (window=%s, user=%d, thread=%d)",
-        old_name,
-        new_name,
-        wid,
-        user.id,
-        thread_id,
-    )
+    tmux windows keep a stable technical name (project + topic id). Propagating
+    a topic rename to the tmux window (and to the display name) would also break
+    startup re-resolution, which matches display names against live tmux window
+    names. So a topic rename is intentionally a no-op here.
+    """
+    return
 
 
 async def forward_command_handler(
@@ -1159,11 +1131,18 @@ async def _create_and_bind_window(
     # + group chat_id seed + monitor pre-watch + pending text. thread_id/user/
     # chat are passed EXPLICITLY (not read from clobberable user_data inside).
     chat_id = query.message.chat.id if query.message else None
-    # The user's first message NAMES the topic — it is never forwarded to Claude.
+    # The first message names the Telegram TOPIC (never forwarded to Claude).
     pending_text = (
         context.user_data.get("_pending_thread_text") if context.user_data else None
     )
     topic_name = _sanitize_topic_name(pending_text)
+    # tmux window name = project + topic id. Topic titles are deliberately NOT
+    # dragged into tmux, so the window keeps a stable, technical name.
+    window_name = (
+        f"{Path(selected_path).name}-{pending_thread_id}"
+        if pending_thread_id is not None
+        else None
+    )
 
     result = await service.create_session(
         selected_path,
@@ -1172,7 +1151,7 @@ async def _create_and_bind_window(
         user_id=user.id,
         chat_id=chat_id,
         pending_text=None,
-        window_name=topic_name,
+        window_name=window_name,
     )
 
     # Creation done — clear pending state regardless of outcome.
@@ -1192,18 +1171,17 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
-        # Rename the Telegram forum topic to match the window name (the user's
-        # first message). Best-effort — a failure must not abort session setup.
+        # Rename the Telegram forum topic to the user's first message.
+        # Best-effort — a failure must not abort session setup.
         if topic_name and pending_thread_id is not None and chat_id is not None:
-            new_name = result.window_name or topic_name
             try:
                 await context.bot.edit_forum_topic(
                     chat_id=chat_id,
                     message_thread_id=pending_thread_id,
-                    name=new_name,
+                    name=topic_name,
                 )
             except Exception as e:
-                logger.warning("Failed to rename forum topic to %r: %s", new_name, e)
+                logger.warning("Failed to rename forum topic to %r: %s", topic_name, e)
         if pending_thread_id is not None:
             status = "Resumed" if resume_session_id else "Created"
             await safe_edit(

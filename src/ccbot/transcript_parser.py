@@ -499,7 +499,6 @@ class TranscriptParser:
 
             if msg_type == "assistant":
                 # Process content blocks
-                has_text = False
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -516,7 +515,6 @@ class TranscriptParser:
                                     timestamp=entry_timestamp,
                                 )
                             )
-                            has_text = True
 
                     elif btype == "tool_use":
                         tool_id = block.get("id", "")
@@ -584,15 +582,10 @@ class TranscriptParser:
                                     timestamp=entry_timestamp,
                                 )
                             )
-                        elif not has_text:
-                            result.append(
-                                ParsedEntry(
-                                    role="assistant",
-                                    text="(thinking)",
-                                    content_type="thinking",
-                                    timestamp=entry_timestamp,
-                                )
-                            )
+                        # Empty thinking blocks (no persisted thinking text) are
+                        # skipped: emitting a "(thinking)" placeholder produced one
+                        # noise message per turn. The status line already signals
+                        # that Claude is working.
 
             elif msg_type == "user":
                 # Check for tool_result blocks and merge with pending tools

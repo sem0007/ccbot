@@ -518,14 +518,33 @@ async def topic_closed_handler(
 async def topic_edited_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Ignore Telegram topic renames — topic titles are NOT dragged into tmux.
+    """Record a Telegram topic rename for the control dashboard only.
 
-    tmux windows keep a stable technical name (project + topic id). Propagating
-    a topic rename to the tmux window (and to the display name) would also break
-    startup re-resolution, which matches display names against live tmux window
-    names. So a topic rename is intentionally a no-op here.
+    tmux windows keep a stable technical name (project + topic id), so a topic
+    rename is deliberately NOT propagated to the tmux window or the display
+    name — doing so would also break startup re-resolution, which matches
+    display names against live tmux window names. We only remember the new
+    title so the dashboard can show which topic maps to which session.
     """
-    return
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    msg = update.message
+    if not msg or not msg.forum_topic_edited:
+        return
+
+    new_name = msg.forum_topic_edited.name
+    if new_name is None:
+        # Icon-only change, no rename.
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        return
+
+    session_manager.set_topic_name(thread_id, new_name)
+    logger.info("Topic renamed to %r (thread=%d)", new_name, thread_id)
 
 
 async def forward_command_handler(
@@ -1171,9 +1190,11 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
-        # Rename the Telegram forum topic to the user's first message.
-        # Best-effort — a failure must not abort session setup.
+        # Rename the Telegram forum topic to the user's first message and
+        # remember the title for the control dashboard. Best-effort — a failure
+        # must not abort session setup.
         if topic_name and pending_thread_id is not None and chat_id is not None:
+            session_manager.set_topic_name(pending_thread_id, topic_name)
             try:
                 await context.bot.edit_forum_topic(
                     chat_id=chat_id,

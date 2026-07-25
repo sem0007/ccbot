@@ -10,6 +10,7 @@ Key function: render_dashboard(service) -> (text, InlineKeyboardMarkup).
 
 from __future__ import annotations
 
+import html
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -42,20 +43,25 @@ async def render_dashboard(service: Any) -> tuple[str, InlineKeyboardMarkup]:
         st = bind_status.get(s["window_id"], "")
         st_icon = _STATUS_ICON.get(st, "⚪")
         sid = (s.get("session_id") or "")[:8] or "—"
-        name = s.get("window_name") or s["window_id"]
-        # The bold name already IS the topic name (window_display_names is kept
-        # in sync with Telegram topic renames), so don't repeat the raw numeric
-        # thread id — only flag sessions that have no topic bound at all.
+        window_name = s.get("window_name") or s["window_id"]
+        # Show the friendly Telegram topic title (bold) so the human can map a
+        # topic to its session; the technical tmux window name (project-topicid)
+        # follows. Fall back to the window name when the title isn't known yet.
+        topic_name = s.get("topic_name")
         thr = s.get("thread_id")
-        thr_txt = "" if thr else " · без темы"
+        if topic_name and topic_name != window_name:
+            label = f"<b>{html.escape(topic_name)}</b> · {html.escape(window_name)}"
+        else:
+            label = f"<b>{html.escape(window_name)}</b>"
+        no_topic = "" if thr else " · без темы"
         flags = ""
         if s.get("pending_bind"):
             flags += " ⏳"
         if s.get("orphaned"):
             flags += " 🗑"
         lines.append(
-            f"{icon}{st_icon} <b>{name}</b> <code>{s['window_id']}</code> "
-            f"· {sid}{thr_txt}{flags}"
+            f"{icon}{st_icon} {label} <code>{s['window_id']}</code> "
+            f"· {sid}{no_topic}{flags}"
         )
 
     text = "\n".join(lines)

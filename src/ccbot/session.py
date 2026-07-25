@@ -141,6 +141,11 @@ class SessionManager:
     # message to a thread, so we track them ourselves to let /fixcontrol wipe
     # the topic clean. Bounded to avoid unbounded growth.
     control_message_ids: list[int] = field(default_factory=list)
+    # Telegram forum-topic titles, keyed by thread_id. Kept SEPARATE from
+    # window_display_names on purpose: display names must stay equal to the tmux
+    # window name (project-topicid) for startup re-resolution, so the friendly
+    # topic title lives here and is shown only in the control dashboard.
+    topic_names: dict[int, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -198,6 +203,7 @@ class SessionManager:
             "group_chat_ids": self.group_chat_ids,
             "control_topic": self.control_topic,
             "control_message_ids": self.control_message_ids,
+            "topic_names": {str(tid): name for tid, name in self.topic_names.items()},
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -226,6 +232,19 @@ class SessionManager:
         self._save_state()
         return ids
 
+    def set_topic_name(self, thread_id: int, name: str) -> None:
+        """Remember a Telegram topic's title (for the control dashboard)."""
+        if self.topic_names.get(thread_id) == name:
+            return
+        self.topic_names[thread_id] = name
+        self._save_state()
+
+    def get_topic_name(self, thread_id: int | None) -> str | None:
+        """Return the stored Telegram topic title for a thread, if known."""
+        if thread_id is None:
+            return None
+        return self.topic_names.get(thread_id)
+
     def _load_state(self) -> None:
         """Load state synchronously during initialization.
 
@@ -253,6 +272,10 @@ class SessionManager:
                 }
                 self.control_topic = state.get("control_topic")
                 self.control_message_ids = list(state.get("control_message_ids", []))
+                self.topic_names = {
+                    int(tid): name
+                    for tid, name in state.get("topic_names", {}).items()
+                }
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -285,6 +308,7 @@ class SessionManager:
                 self.group_chat_ids = {}
                 self.control_topic = None
                 self.control_message_ids = []
+                self.topic_names = {}
                 pass
 
     async def resolve_stale_ids(self) -> None:

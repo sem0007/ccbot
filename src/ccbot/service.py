@@ -383,6 +383,7 @@ class ControlService:
                     "pane_cmd": w.pane_current_command,
                     "user_id": bind[0] if bind else None,
                     "thread_id": bind[1] if bind else None,
+                    "topic_name": self.sm.get_topic_name(bind[1]) if bind else None,
                     "monitor_offset": tracked.last_byte_offset if tracked else None,
                     "pending_bind": bool(ws and ws.pending_bind),
                     "requested_resume_id": ws.requested_resume_id if ws else None,
@@ -402,6 +403,7 @@ class ControlService:
                         "orphaned": True,
                         "user_id": bind[0] if bind else None,
                         "thread_id": bind[1] if bind else None,
+                        "topic_name": self.sm.get_topic_name(bind[1]) if bind else None,
                     }
                 )
         return out
